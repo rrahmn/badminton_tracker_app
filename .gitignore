@@ -3,4 +3,3 @@ __pycache__/
 *.pyc
 .streamlit/secrets.toml
 data/*.csv
-*.py[cod]

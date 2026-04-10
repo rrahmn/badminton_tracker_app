@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import io
 import re
-import zipfile
 from datetime import date, datetime
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
@@ -23,6 +21,20 @@ DATA_DIR = APP_DIR / "data"
 st.set_page_config(page_title="Badminton Tracker", layout="wide")
 st.title("🏸 Badminton Tracker")
 st.caption("Track singles and doubles matches, clips, player events and Elo.")
+
+st.markdown("""
+<style>
+.block-container {padding-top: 1.4rem; padding-bottom: 1.4rem; max-width: 1400px;}
+[data-testid="stSidebar"] {border-right: 1px solid rgba(120,120,120,.15);}
+[data-testid="stMetricValue"] {font-size: 1.45rem;}
+div[data-baseweb="tab-list"] {gap: .35rem; flex-wrap: wrap;}
+div[data-baseweb="tab"] {background: rgba(255,255,255,.04); border: 1px solid rgba(120,120,120,.18); padding: .45rem .8rem; border-radius: 999px;}
+div[data-baseweb="tab"][aria-selected="true"] {background: rgba(34,197,94,.12); border-color: rgba(34,197,94,.38);}
+.st-emotion-cache-1r6slb0, .st-emotion-cache-13ln4jf {border-radius: 18px;}
+[data-testid="stDataFrame"] {border: 1px solid rgba(120,120,120,.12); border-radius: 16px; overflow: hidden;}
+[data-testid="stVerticalBlock"] div[data-testid="stForm"] {border: 1px solid rgba(120,120,120,.12); border-radius: 18px; padding: 1rem; background: rgba(255,255,255,.02);}
+</style>
+""", unsafe_allow_html=True)
 
 require_login()
 current_role = get_role()
@@ -363,15 +375,6 @@ def complete_match(match_id: str) -> None:
     refresh_state()
 
 
-def export_zip_bytes() -> bytes:
-    mem = io.BytesIO()
-    with zipfile.ZipFile(mem, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
-        for name in DATA_FILES:
-            zf.write(DATA_DIR / f"{name}.csv", arcname=f"{name}.csv")
-    mem.seek(0)
-    return mem.getvalue()
-
-
 def parse_date_str(raw: str) -> date:
     try:
         return date.fromisoformat(str(raw))
@@ -574,17 +577,28 @@ def render_player_explorer(players_df: pd.DataFrame, stats_df: pd.DataFrame, rev
     )
 
 
+def render_top_summary(players_df: pd.DataFrame, matches_df: pd.DataFrame, review_df: pd.DataFrame) -> None:
+    total_players = 0 if players_df.empty else int(players_df["player_id"].nunique())
+    total_matches = 0 if matches_df.empty else int(matches_df["match_id"].nunique())
+    live_matches = 0 if matches_df.empty else int(matches_df["status"].eq("In Progress").sum())
+    total_clips = 0 if review_df.empty else int(review_df[review_df["clip_url"].astype(str).ne("")]["event_id"].nunique())
+    top_cols = st.columns(4)
+    top_cols[0].metric("Players", total_players)
+    top_cols[1].metric("Matches", total_matches)
+    top_cols[2].metric("Live matches", live_matches)
+    top_cols[3].metric("Tagged clips", total_clips)
+
+
 with st.sidebar:
-    st.header("Access")
+    st.markdown("### Session")
     st.write(f"Signed in as: {get_display_name()}")
     st.write(f"Role: {current_role}")
     st.button("Log out", on_click=logout, use_container_width=True)
-    st.divider()
 
-    st.header("Players")
+    st.markdown("### Quick add player")
     with st.form("add_player_form", clear_on_submit=True):
-        new_player_name = st.text_input("Add player")
-        submitted = st.form_submit_button("Save player")
+        new_player_name = st.text_input("Player name", placeholder="Add a new player")
+        submitted = st.form_submit_button("Save player", use_container_width=True)
         if submitted:
             require_editor()
             if not new_player_name.strip():
@@ -604,40 +618,18 @@ with st.sidebar:
                 refresh_state()
                 st.success(f"Added {new_player_name.strip()}")
 
-    st.divider()
-    st.header("Data")
-    st.download_button(
-        "Export data (.zip)",
-        data=export_zip_bytes(),
-        file_name="badminton_tracker_data.zip",
-        mime="application/zip",
-    )
-
-    uploaded = st.file_uploader("Import data zip", type=["zip"], disabled=current_role != "admin")
-    if uploaded is not None:
-        require_editor()
-        try:
-            with zipfile.ZipFile(uploaded) as zf:
-                payload = {}
-                for name, columns in DATA_FILES.items():
-                    with zf.open(f"{name}.csv") as f:
-                        df = pd.read_csv(f)
-                        for column in columns:
-                            if column not in df.columns:
-                                df[column] = None
-                        payload[name] = df[columns]
-                storage.replace_all(payload)
-                refresh_state()
-                st.success("Data imported.")
-        except Exception as exc:
-            st.error(f"Could not import zip: {exc}")
+    with st.expander("About this app", expanded=False):
+        st.write("Use Live Match to tag clips, Matches to review one game in depth, and Player Explorer to trace one player across all games.")
+        st.write("Tip: embed a YouTube link on the match and tag every event with a clip range so you can review it later.")
 
 
 players_lookup = player_name_map()
 stats_df = build_player_stats(players_df, matches_df, events_df, elo_history_df)
 review_df = build_event_review_df(events_df, matches_df, players_lookup)
+render_top_summary(players_df, matches_df, review_df)
+
 tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
-    "Live Match", "Players & Elo", "Stats", "Matches", "Good Shots", "Bad Shots", "Highlights", "Player Explorer", "Match History"
+    "🎬 Live Match", "🏅 Elo", "📊 Stats", "🗂️ Matches", "✅ Good Shots", "❌ Bad Shots", "⭐ Highlights", "🧍 Player Explorer", "📅 Match History"
 ])
 
 with tab1:
