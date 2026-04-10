@@ -48,6 +48,14 @@ DATA_FILES: Dict[str, list[str]] = {
         "new_elo",
         "delta",
         "recorded_at",
+        "elo_model_version",
+        "k_factor_used",
+    ],
+    "match_participants": [
+        "match_id",
+        "player_id",
+        "team",
+        "slot",
     ],
 }
 

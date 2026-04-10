@@ -11,7 +11,7 @@ import plotly.express as px
 import streamlit as st
 
 from src.auth import auth_is_configured, get_display_name, get_role, logout, require_editor, require_login
-from src.elo import BASE_ELO, update_team_elos
+from src.elo import BASE_ELO, ELO_MODEL_VERSION, K_FACTOR, update_team_elos
 from src.stats import build_player_stats, current_elo_map
 from src.storage import CSVStorage, DATA_FILES
 
@@ -180,12 +180,20 @@ def safe_load(name: str) -> pd.DataFrame:
         df["is_active"] = df["is_active"].fillna(True)
 
     elif name == "elo_history":
-        text_cols = ["history_id", "match_id", "player_id", "recorded_at"]
-        num_cols = ["old_elo", "new_elo", "delta"]
+        text_cols = ["history_id", "match_id", "player_id", "recorded_at", "elo_model_version"]
+        num_cols = ["old_elo", "new_elo", "delta", "k_factor_used"]
         for col in text_cols:
             df[col] = df[col].fillna("").astype(str)
         for col in num_cols:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+
+    elif name == "match_participants":
+        text_cols = ["match_id", "player_id", "team"]
+        int_cols = ["slot"]
+        for col in text_cols:
+            df[col] = df[col].fillna("").astype(str)
+        for col in int_cols:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
 
     return df[DATA_FILES[name]]
 
@@ -195,6 +203,7 @@ def refresh_state() -> None:
     st.session_state.matches_df = safe_load("matches")
     st.session_state.events_df = safe_load("events")
     st.session_state.elo_history_df = safe_load("elo_history")
+    st.session_state.match_participants_df = safe_load("match_participants")
 
 
 if "booted" not in st.session_state:
@@ -205,6 +214,7 @@ players_df = st.session_state.players_df
 matches_df = st.session_state.matches_df
 events_df = st.session_state.events_df
 elo_history_df = st.session_state.elo_history_df
+match_participants_df = st.session_state.match_participants_df
 
 
 def player_name_map() -> dict[str, str]:
@@ -232,6 +242,35 @@ def parse_players(cell: str) -> list[str]:
 def save_df(name: str, df: pd.DataFrame) -> None:
     storage.save(name, df)
     refresh_state()
+
+
+def get_match_participants(match_id: str) -> pd.DataFrame:
+    df = st.session_state.match_participants_df
+    if df.empty:
+        return df.copy()
+    out = df[df["match_id"].astype(str) == str(match_id)].copy()
+    if not out.empty:
+        out = out.sort_values(["team", "slot", "player_id"])
+    return out
+
+
+def get_match_team_ids(match_row: pd.Series, team: str) -> list[str]:
+    team = str(team)
+    match_id = str(match_row.get("match_id", ""))
+    participants = get_match_participants(match_id)
+    if not participants.empty:
+        return participants.loc[participants["team"] == team, "player_id"].astype(str).tolist()
+    legacy_col = "team_a_players" if team == "A" else "team_b_players"
+    return parse_players(str(match_row.get(legacy_col, "")))
+
+
+def create_match_participants_rows(match_id: str, team_a_ids: list[str], team_b_ids: list[str]) -> pd.DataFrame:
+    rows = []
+    for slot, pid in enumerate(team_a_ids, start=1):
+        rows.append({"match_id": match_id, "player_id": str(pid), "team": "A", "slot": slot})
+    for slot, pid in enumerate(team_b_ids, start=1):
+        rows.append({"match_id": match_id, "player_id": str(pid), "team": "B", "slot": slot})
+    return pd.DataFrame(rows, columns=DATA_FILES["match_participants"])
 
 
 def update_match_details(match_id: str, *, video_url: str, scheduled_date: str, scheduled_time: str, notes: str) -> None:
@@ -273,7 +312,7 @@ def record_event(
         "timestamp": now_iso(),
         "event_index": int(current_events["event_index"].max() + 1) if not current_events.empty else 1,
         "team": team,
-        "player_id": player_id,
+        "player_id": str(player_id or ""),
         "event_type": event_type,
         "points_awarded": points_awarded,
         "note": note,
@@ -342,8 +381,8 @@ def complete_match(match_id: str) -> None:
     elo_history = st.session_state.elo_history_df.copy()
     elo_map = current_elo_map(players_df, elo_history)
 
-    team_a_ids = parse_players(row["team_a_players"])
-    team_b_ids = parse_players(row["team_b_players"])
+    team_a_ids = get_match_team_ids(row, "A")
+    team_b_ids = get_match_team_ids(row, "B")
     team_a_old = [elo_map.get(pid, BASE_ELO) for pid in team_a_ids]
     team_b_old = [elo_map.get(pid, BASE_ELO) for pid in team_b_ids]
     team_a_new, team_b_new = update_team_elos(team_a_old, team_b_old, winner)
@@ -358,6 +397,8 @@ def complete_match(match_id: str) -> None:
             "new_elo": new,
             "delta": round(new - old, 2),
             "recorded_at": now_iso(),
+            "elo_model_version": ELO_MODEL_VERSION,
+            "k_factor_used": float(K_FACTOR),
         })
     for pid, old, new in zip(team_b_ids, team_b_old, team_b_new):
         history_rows.append({
@@ -368,6 +409,8 @@ def complete_match(match_id: str) -> None:
             "new_elo": new,
             "delta": round(new - old, 2),
             "recorded_at": now_iso(),
+            "elo_model_version": ELO_MODEL_VERSION,
+            "k_factor_used": float(K_FACTOR),
         })
 
     elo_history = pd.concat([elo_history, pd.DataFrame(history_rows)], ignore_index=True)
@@ -391,8 +434,8 @@ def add_match_display_columns(df: pd.DataFrame, players_lookup: dict[str, str]) 
     if df.empty:
         return df.copy()
     out = df.copy()
-    out["team_a_names"] = out["team_a_players"].apply(lambda x: " / ".join(players_lookup.get(pid, pid) for pid in parse_players(x)))
-    out["team_b_names"] = out["team_b_players"].apply(lambda x: " / ".join(players_lookup.get(pid, pid) for pid in parse_players(x)))
+    out["team_a_names"] = out.apply(lambda row: " / ".join(players_lookup.get(pid, pid) for pid in get_match_team_ids(row, "A")), axis=1)
+    out["team_b_names"] = out.apply(lambda row: " / ".join(players_lookup.get(pid, pid) for pid in get_match_team_ids(row, "B")), axis=1)
     out["winner_label"] = out.apply(
         lambda row: row["team_a_names"] if row["winner"] == "A" else (row["team_b_names"] if row["winner"] == "B" else ""),
         axis=1,
@@ -409,7 +452,8 @@ def build_event_review_df(events_df: pd.DataFrame, matches_df: pd.DataFrame, pla
         return pd.DataFrame()
 
     review = events_df.copy()
-    review["player"] = review["player_id"].astype(str).map(players_lookup).fillna(review["player_id"].astype(str))
+    review["player"] = review["player_id"].astype(str).map(players_lookup)
+    review["player"] = review.apply(lambda row: row["player"] if str(row.get("player", "")).strip() else f"Team {row['team']} (unattributed)", axis=1)
     review["clip_range"] = review.apply(
         lambda row: f"{row['video_start_label'] or format_seconds(row['video_start_seconds'])} → {row['video_end_label'] or format_seconds(row['video_end_seconds'])}",
         axis=1,
@@ -515,10 +559,14 @@ def render_player_explorer(players_df: pd.DataFrame, stats_df: pd.DataFrame, rev
         metric_cols[5].metric("Highlights", int(stat_row["highlights"]))
 
     player_events = review_df[review_df["player_id"].astype(str) == selected_pid].copy() if not review_df.empty else pd.DataFrame()
-    player_matches = matches_df[
-        matches_df["team_a_players"].fillna("").astype(str).str.contains(selected_pid)
-        | matches_df["team_b_players"].fillna("").astype(str).str.contains(selected_pid)
-    ].copy()
+    if not match_participants_df.empty:
+        player_match_ids = match_participants_df.loc[match_participants_df["player_id"].astype(str) == selected_pid, "match_id"].astype(str).unique().tolist()
+        player_matches = matches_df[matches_df["match_id"].astype(str).isin(player_match_ids)].copy()
+    else:
+        player_matches = matches_df[
+            matches_df["team_a_players"].fillna("").astype(str).str.contains(selected_pid)
+            | matches_df["team_b_players"].fillna("").astype(str).str.contains(selected_pid)
+        ].copy()
     player_matches = add_match_display_columns(player_matches, players_lookup)
 
     st.markdown("#### Matches")
@@ -624,7 +672,7 @@ with st.sidebar:
 
 
 players_lookup = player_name_map()
-stats_df = build_player_stats(players_df, matches_df, events_df, elo_history_df)
+stats_df = build_player_stats(players_df, matches_df, events_df, elo_history_df, match_participants_df)
 review_df = build_event_review_df(events_df, matches_df, players_lookup)
 render_top_summary(players_df, matches_df, review_df)
 
@@ -683,12 +731,14 @@ with tab1:
                             "notes": (notes or "").strip(),
                         }
                         storage.append_row("matches", row)
+                        participants_payload = pd.concat([st.session_state.match_participants_df, create_match_participants_rows(row["match_id"], parse_players(row["team_a_players"]), parse_players(row["team_b_players"]))], ignore_index=True)
+                        storage.save("match_participants", participants_payload)
                         refresh_state()
                         st.success("Match created.")
                         st.rerun()
     else:
-        team_a_ids = parse_players(active_match["team_a_players"])
-        team_b_ids = parse_players(active_match["team_b_players"])
+        team_a_ids = get_match_team_ids(active_match, "A")
+        team_b_ids = get_match_team_ids(active_match, "B")
         team_a_names = [players_lookup.get(pid, pid) for pid in team_a_ids]
         team_b_names = [players_lookup.get(pid, pid) for pid in team_b_ids]
         all_live_names = team_a_names + team_b_names
@@ -749,8 +799,10 @@ with tab1:
         selected_player_name = selector_cols[0].selectbox("Selected player", all_live_names, key="selected_player_name")
         selected_team = "A" if selected_player_name in team_a_names else "B"
         selected_pid = next(pid for pid, name in players_lookup.items() if name == selected_player_name)
-        scorer_a = selector_cols[1].selectbox("Who scored for Team A?", team_a_names, key="scorer_a")
-        scorer_b = selector_cols[2].selectbox("Who scored for Team B?", team_b_names, key="scorer_b")
+        scorer_a_options = ["Team point (unattributed)"] + team_a_names
+        scorer_b_options = ["Team point (unattributed)"] + team_b_names
+        scorer_a = selector_cols[1].selectbox("Who scored for Team A?", scorer_a_options, key="scorer_a")
+        scorer_b = selector_cols[2].selectbox("Who scored for Team B?", scorer_b_options, key="scorer_b")
 
         valid_clip = start_seconds is not None and end_seconds is not None and end_seconds >= start_seconds
         if not valid_clip:
@@ -765,7 +817,7 @@ with tab1:
             if not valid_clip:
                 st.error("Enter a valid clip start and end first.")
             else:
-                scorer_id = next(pid for pid, name in players_lookup.items() if name == scorer_a)
+                scorer_id = next((pid for pid, name in players_lookup.items() if name == scorer_a), None)
                 record_event(match_id, "A", scorer_id, "point", points_awarded=1, video_start_seconds=start_seconds, video_end_seconds=end_seconds)
                 save_clip_presets(format_seconds(end_seconds), format_seconds(end_seconds))
                 st.rerun()
@@ -774,7 +826,7 @@ with tab1:
             if not valid_clip:
                 st.error("Enter a valid clip start and end first.")
             else:
-                scorer_id = next(pid for pid, name in players_lookup.items() if name == scorer_b)
+                scorer_id = next((pid for pid, name in players_lookup.items() if name == scorer_b), None)
                 record_event(match_id, "B", scorer_id, "point", points_awarded=1, video_start_seconds=start_seconds, video_end_seconds=end_seconds)
                 save_clip_presets(format_seconds(end_seconds), format_seconds(end_seconds))
                 st.rerun()
@@ -816,6 +868,7 @@ with tab1:
         event_log = get_match_events(match_id).copy()
         if not event_log.empty:
             event_log["player"] = event_log["player_id"].astype(str).map(players_lookup)
+            event_log["player"] = event_log.apply(lambda row: row["player"] if str(row.get("player", "")).strip() else f"Team {row['team']} (unattributed)", axis=1)
             event_log["clip_range"] = event_log.apply(lambda row: f"{row['video_start_label']} → {row['video_end_label']}".strip(" →"), axis=1)
             st.markdown("#### Event log")
             st.dataframe(

@@ -18,7 +18,13 @@ def current_elo_map(players_df: pd.DataFrame, history_df: pd.DataFrame) -> dict[
     return elo_map
 
 
-def build_player_stats(players_df: pd.DataFrame, matches_df: pd.DataFrame, events_df: pd.DataFrame, history_df: pd.DataFrame) -> pd.DataFrame:
+def build_player_stats(
+    players_df: pd.DataFrame,
+    matches_df: pd.DataFrame,
+    events_df: pd.DataFrame,
+    history_df: pd.DataFrame,
+    participants_df: pd.DataFrame | None = None,
+) -> pd.DataFrame:
     if players_df.empty:
         return pd.DataFrame()
 
@@ -27,30 +33,49 @@ def build_player_stats(players_df: pd.DataFrame, matches_df: pd.DataFrame, event
 
     matches_df = matches_df.copy()
     events_df = events_df.copy()
+    participants_df = participants_df.copy() if participants_df is not None else pd.DataFrame(columns=["match_id", "player_id", "team", "slot"])
     if not events_df.empty:
-        events_df["player_id"] = events_df["player_id"].astype(str)
+        events_df["player_id"] = events_df["player_id"].fillna("").astype(str)
         events_df["points_awarded"] = pd.to_numeric(events_df["points_awarded"], errors="coerce").fillna(0)
+    if not participants_df.empty:
+        participants_df["player_id"] = participants_df["player_id"].astype(str)
+        participants_df["match_id"] = participants_df["match_id"].astype(str)
 
     for _, player in players_df.iterrows():
         pid = str(player["player_id"])
         name = player["name"]
 
-        player_matches = matches_df[
-            matches_df["team_a_players"].fillna("").str.contains(pid)
-            | matches_df["team_b_players"].fillna("").str.contains(pid)
-        ].copy()
+        if not participants_df.empty:
+            match_ids = participants_df.loc[participants_df["player_id"] == pid, "match_id"].astype(str).unique().tolist()
+            player_matches = matches_df[matches_df["match_id"].astype(str).isin(match_ids)].copy()
+        else:
+            player_matches = matches_df[
+                matches_df["team_a_players"].fillna("").str.contains(pid)
+                | matches_df["team_b_players"].fillna("").str.contains(pid)
+            ].copy()
 
         wins = 0
         losses = 0
         for _, match in player_matches.iterrows():
-            in_a = pid in str(match["team_a_players"]).split("|")
-            in_b = pid in str(match["team_b_players"]).split("|")
             if match["status"] != "Completed":
                 continue
-            if (in_a and match["winner"] == "A") or (in_b and match["winner"] == "B"):
-                wins += 1
-            elif match["winner"] in {"A", "B"}:
-                losses += 1
+
+            if not participants_df.empty:
+                p_rows = participants_df[(participants_df["match_id"].astype(str) == str(match["match_id"])) & (participants_df["player_id"] == pid)]
+                if p_rows.empty:
+                    continue
+                team = str(p_rows.iloc[0]["team"])
+                if (team == "A" and match["winner"] == "A") or (team == "B" and match["winner"] == "B"):
+                    wins += 1
+                elif match["winner"] in {"A", "B"}:
+                    losses += 1
+            else:
+                in_a = pid in str(match["team_a_players"]).split("|")
+                in_b = pid in str(match["team_b_players"]).split("|")
+                if (in_a and match["winner"] == "A") or (in_b and match["winner"] == "B"):
+                    wins += 1
+                elif match["winner"] in {"A", "B"}:
+                    losses += 1
 
         player_events = events_df[events_df["player_id"] == pid] if not events_df.empty else pd.DataFrame()
         good_shots = int((player_events["event_type"] == "good_shot").sum()) if not player_events.empty else 0
