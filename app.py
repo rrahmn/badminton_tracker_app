@@ -13,7 +13,7 @@ import streamlit as st
 from src.auth import auth_is_configured, get_display_name, get_role, logout, require_editor, require_login
 from src.elo import BASE_ELO, ELO_MODEL_VERSION, K_FACTOR, update_team_elos
 from src.stats import build_player_stats, current_elo_map
-from src.storage import CSVStorage, DATA_FILES
+from src.storage import CSVStorage, SupabaseStorage, DATA_FILES
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -38,7 +38,20 @@ div[data-baseweb="tab"][aria-selected="true"] {background: rgba(34,197,94,.12); 
 
 require_login()
 current_role = get_role()
-storage = CSVStorage(DATA_DIR)
+
+def build_storage():
+    try:
+        supabase_cfg = st.secrets.get("supabase", {})
+    except Exception:
+        supabase_cfg = {}
+    url = str(supabase_cfg.get("url", "") or "").strip()
+    key = str(supabase_cfg.get("key", "") or "").strip()
+    if url and key:
+        return SupabaseStorage(url=url, key=key), "Supabase"
+    return CSVStorage(DATA_DIR), "CSV"
+
+
+storage, storage_backend = build_storage()
 
 TIME_RE = re.compile(r"^(?:(\d+):)?(\d{1,2}):(\d{2})$|^(\d+)$")
 
