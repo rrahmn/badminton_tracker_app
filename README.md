@@ -122,3 +122,18 @@ viewer = "your-viewer-password"
 ```
 
 On Streamlit Community Cloud, put the same block into the app Secrets settings.
+
+
+## Windows shortcuts
+
+If you are using Windows CMD or PowerShell and do not want to use `make`, use these files instead:
+
+- `setup.bat` → creates `.venv`, installs requirements, and creates `.streamlit/secrets.toml` from the example file
+- `run.bat` → activates `.venv` and runs the Streamlit app
+
+Usage:
+
+```bat
+setup.bat
+run.bat
+```
