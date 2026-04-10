@@ -19,6 +19,10 @@ DATA_FILES: Dict[str, list[str]] = {
         "team_b_score",
         "winner",
         "status",
+        "video_url",
+        "scheduled_date",
+        "scheduled_time",
+        "notes",
     ],
     "events": [
         "event_id",
@@ -30,6 +34,11 @@ DATA_FILES: Dict[str, list[str]] = {
         "event_type",
         "points_awarded",
         "note",
+        "video_start_seconds",
+        "video_end_seconds",
+        "video_start_label",
+        "video_end_label",
+        "clip_url",
     ],
     "elo_history": [
         "history_id",

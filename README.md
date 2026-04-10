@@ -90,3 +90,35 @@ streamlit run app.py
 - Rally-level tagging
 - Shot heatmaps and richer analytics
 - Mobile-first UI
+
+
+## Authentication and roles
+
+This version supports Streamlit OIDC login plus two roles:
+- `editor`: can add players, create matches, record events, import data and complete matches
+- `viewer`: read-only access to stats, history and exports
+
+### Local setup
+1. Copy `.streamlit/secrets.example.toml` to `.streamlit/secrets.toml`
+2. Fill in your OIDC values and role email lists
+3. Keep `.streamlit/secrets.toml` out of Git
+
+### Streamlit Community Cloud
+Add the same values in your app Secrets settings. Keep the repo public if you want. The allowed emails stay private in Streamlit secrets.
+
+## Password roles
+
+This app now uses two shared passwords stored in Streamlit secrets:
+
+- `admin`: full access
+- `viewer`: read-only access
+
+Create `.streamlit/secrets.toml` locally with:
+
+```toml
+[passwords]
+admin = "your-admin-password"
+viewer = "your-viewer-password"
+```
+
+On Streamlit Community Cloud, put the same block into the app Secrets settings.

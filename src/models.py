@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 MatchType = Literal["Singles", "Doubles"]
-EventType = Literal["point", "good_shot", "bad_shot", "service_fault"]
+EventType = Literal["point", "good_shot", "bad_shot", "service_fault", "highlight"]
 
 
 @dataclass

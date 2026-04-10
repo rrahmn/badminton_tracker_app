@@ -56,6 +56,7 @@ def build_player_stats(players_df: pd.DataFrame, matches_df: pd.DataFrame, event
         good_shots = int((player_events["event_type"] == "good_shot").sum()) if not player_events.empty else 0
         bad_shots = int((player_events["event_type"] == "bad_shot").sum()) if not player_events.empty else 0
         service_faults = int((player_events["event_type"] == "service_fault").sum()) if not player_events.empty else 0
+        highlights = int((player_events["event_type"] == "highlight").sum()) if not player_events.empty else 0
         points_won = int(player_events["points_awarded"].sum()) if not player_events.empty else 0
         matches_played = wins + losses
         win_rate = round((wins / matches_played) * 100, 1) if matches_played else 0.0
@@ -74,6 +75,7 @@ def build_player_stats(players_df: pd.DataFrame, matches_df: pd.DataFrame, event
                 "good_shots": good_shots,
                 "bad_shots": bad_shots,
                 "service_faults": service_faults,
+                "highlights": highlights,
                 "shot_balance": shot_balance,
             }
         )
