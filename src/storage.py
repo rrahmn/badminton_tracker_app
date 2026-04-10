@@ -142,6 +142,43 @@ def _df_to_records(df: pd.DataFrame) -> list[dict[str, Any]]:
     return rows
 
 
+def _normalize_db_nulls(name: str, payload: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(payload)
+    nullable_text_blank_to_none: dict[str, set[str]] = {
+        "matches": {"completed_at", "video_url", "notes", "winner", "status", "match_type", "match_date", "match_time"},
+        "events": {"note", "player_id", "video_start_label", "video_end_label", "clip_url", "team", "event_type"},
+        "elo_history": {"elo_model_version"},
+        "players": set(),
+        "match_participants": set(),
+    }
+    integer_fields: dict[str, set[str]] = {
+        "matches": {"points_to_win", "team_a_score", "team_b_score"},
+        "events": {"event_index", "points_awarded", "video_start_seconds", "video_end_seconds"},
+        "elo_history": {"old_elo", "new_elo", "delta", "k_factor_used"},
+        "match_participants": {"slot"},
+    }
+    for col in nullable_text_blank_to_none.get(name, set()):
+        if normalized.get(col) == "":
+            normalized[col] = None
+    # typed / optional columns that must never be sent as empty strings
+    for col in ["created_at", "completed_at", "timestamp", "recorded_at", "match_date", "match_time"]:
+        if col in normalized and normalized.get(col) == "":
+            normalized[col] = None
+
+    for col in integer_fields.get(name, set()):
+        if col not in normalized:
+            continue
+        value = normalized.get(col)
+        if value in (None, ""):
+            normalized[col] = None
+            continue
+        try:
+            normalized[col] = int(float(value))
+        except (TypeError, ValueError):
+            pass
+    return normalized
+
+
 class SupabaseStorage:
     def __init__(self, url: str, key: str):
         try:
@@ -258,7 +295,7 @@ class SupabaseStorage:
 
         if name == "matches":
             db_df = normalized.drop(columns=["team_a_players", "team_b_players"], errors="ignore").rename(columns={"scheduled_date": "match_date", "scheduled_time": "match_time"})
-            records = _df_to_records(db_df[DB_MATCH_COLUMNS])
+            records = [_normalize_db_nulls(name, rec) for rec in _df_to_records(db_df[DB_MATCH_COLUMNS])]
             if not records:
                 return
             on_conflict = ",".join(PRIMARY_KEYS[name])
@@ -266,7 +303,7 @@ class SupabaseStorage:
                 self.client.table(name).upsert(batch, on_conflict=on_conflict).execute()
             return
 
-        records = _df_to_records(normalized)
+        records = [_normalize_db_nulls(name, rec) for rec in _df_to_records(normalized)]
         if not records:
             return
         on_conflict = ",".join(PRIMARY_KEYS[name])
@@ -276,7 +313,7 @@ class SupabaseStorage:
     def append_row(self, name: str, row: dict) -> None:
         payload = {col: _pythonize_scalar(row.get(col)) for col in DATA_FILES[name]}
         if name == "match_participants":
-            self.client.table(name).insert(payload).execute()
+            self.client.table(name).insert(_normalize_db_nulls(name, payload)).execute()
             return
         if name == "matches":
             payload = {
@@ -294,6 +331,7 @@ class SupabaseStorage:
                 "match_time": payload.get("scheduled_time"),
                 "notes": payload.get("notes"),
             }
+        payload = _normalize_db_nulls(name, payload)
         on_conflict = ",".join(PRIMARY_KEYS[name])
         self.client.table(name).upsert(payload, on_conflict=on_conflict).execute()
 
