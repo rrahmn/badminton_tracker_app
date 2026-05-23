@@ -309,10 +309,11 @@ def record_event(
     note: str = "",
     video_start_seconds: int | None = None,
     video_end_seconds: int | None = None,
+    update_match_score: bool = True,
 ) -> None:
     current_events = get_match_events(match_id)
-    active_match = get_active_match()
-    video_url = str(active_match.get("video_url", "") or "") if active_match is not None else ""
+    match_lookup = st.session_state.matches_df[st.session_state.matches_df["match_id"].astype(str) == str(match_id)]
+    video_url = str(match_lookup.iloc[0].get("video_url", "") or "") if not match_lookup.empty else ""
 
     start_seconds = int(video_start_seconds) if video_start_seconds is not None else 0
     end_seconds = int(video_end_seconds) if video_end_seconds is not None else start_seconds
@@ -340,7 +341,7 @@ def record_event(
 
     matches = st.session_state.matches_df.copy()
     idx = matches.index[matches["match_id"] == match_id]
-    if len(idx) == 1 and points_awarded:
+    if update_match_score and len(idx) == 1 and points_awarded:
         score_col = "team_a_score" if team == "A" else "team_b_score"
         current_val = int(pd.to_numeric(matches.loc[idx, score_col], errors="coerce").fillna(0).iloc[0])
         matches.loc[idx, score_col] = current_val + points_awarded
@@ -370,9 +371,72 @@ def undo_last_event(match_id: str) -> None:
     refresh_state()
 
 
+def match_has_elo_update(match_id: str) -> bool:
+    history = st.session_state.elo_history_df
+    if history.empty:
+        return False
+    return history["match_id"].astype(str).eq(str(match_id)).any()
+
+
+def apply_elo_for_match(match_id: str, winner: str, match_row: pd.Series | None = None) -> None:
+    if match_has_elo_update(match_id):
+        return
+
+    if match_row is None:
+        matches = st.session_state.matches_df
+        rows = matches[matches["match_id"].astype(str) == str(match_id)]
+        if rows.empty:
+            return
+        match_row = rows.iloc[0]
+
+    players_df = st.session_state.players_df.copy()
+    elo_history = st.session_state.elo_history_df.copy()
+    elo_map = current_elo_map(players_df, elo_history)
+
+    team_a_ids = get_match_team_ids(match_row, "A")
+    team_b_ids = get_match_team_ids(match_row, "B")
+    if not team_a_ids or not team_b_ids or winner not in {"A", "B"}:
+        return
+
+    team_a_old = [elo_map.get(pid, BASE_ELO) for pid in team_a_ids]
+    team_b_old = [elo_map.get(pid, BASE_ELO) for pid in team_b_ids]
+    team_a_new, team_b_new = update_team_elos(team_a_old, team_b_old, winner)
+
+    history_rows = []
+    for pid, old, new in zip(team_a_ids, team_a_old, team_a_new):
+        history_rows.append({
+            "history_id": str(uuid4()),
+            "match_id": match_id,
+            "player_id": pid,
+            "old_elo": int(round(old)),
+            "new_elo": int(round(new)),
+            "delta": int(round(new - old)),
+            "recorded_at": now_iso(),
+            "elo_model_version": ELO_MODEL_VERSION,
+            "k_factor_used": int(round(K_FACTOR)),
+        })
+    for pid, old, new in zip(team_b_ids, team_b_old, team_b_new):
+        history_rows.append({
+            "history_id": str(uuid4()),
+            "match_id": match_id,
+            "player_id": pid,
+            "old_elo": int(round(old)),
+            "new_elo": int(round(new)),
+            "delta": int(round(new - old)),
+            "recorded_at": now_iso(),
+            "elo_model_version": ELO_MODEL_VERSION,
+            "k_factor_used": int(round(K_FACTOR)),
+        })
+
+    if history_rows:
+        elo_history = pd.concat([elo_history, pd.DataFrame(history_rows)], ignore_index=True)
+        storage.save("elo_history", elo_history)
+        refresh_state()
+
+
 def complete_match(match_id: str) -> None:
     matches = st.session_state.matches_df.copy()
-    idx = matches.index[matches["match_id"] == match_id]
+    idx = matches.index[matches["match_id"].astype(str) == str(match_id)]
     if len(idx) != 1:
         return
     row = matches.loc[idx[0]]
@@ -387,49 +451,13 @@ def complete_match(match_id: str) -> None:
         matches[col] = matches[col].astype(object)
     matches.loc[idx, "winner"] = winner
     matches.loc[idx, "status"] = "Completed"
-    matches.loc[idx, "completed_at"] = now_iso()
+    if not str(matches.loc[idx[0], "completed_at"] or "").strip():
+        matches.loc[idx, "completed_at"] = now_iso()
     storage.save("matches", matches)
-
-    players_df = st.session_state.players_df.copy()
-    elo_history = st.session_state.elo_history_df.copy()
-    elo_map = current_elo_map(players_df, elo_history)
-
-    team_a_ids = get_match_team_ids(row, "A")
-    team_b_ids = get_match_team_ids(row, "B")
-    team_a_old = [elo_map.get(pid, BASE_ELO) for pid in team_a_ids]
-    team_b_old = [elo_map.get(pid, BASE_ELO) for pid in team_b_ids]
-    team_a_new, team_b_new = update_team_elos(team_a_old, team_b_old, winner)
-
-    history_rows = []
-    for pid, old, new in zip(team_a_ids, team_a_old, team_a_new):
-        history_rows.append({
-            "history_id": str(uuid4()),
-            "match_id": match_id,
-            "player_id": pid,
-            "old_elo": old,
-            "new_elo": new,
-            "delta": round(new - old, 2),
-            "recorded_at": now_iso(),
-            "elo_model_version": ELO_MODEL_VERSION,
-            "k_factor_used": float(K_FACTOR),
-        })
-    for pid, old, new in zip(team_b_ids, team_b_old, team_b_new):
-        history_rows.append({
-            "history_id": str(uuid4()),
-            "match_id": match_id,
-            "player_id": pid,
-            "old_elo": old,
-            "new_elo": new,
-            "delta": round(new - old, 2),
-            "recorded_at": now_iso(),
-            "elo_model_version": ELO_MODEL_VERSION,
-            "k_factor_used": float(K_FACTOR),
-        })
-
-    elo_history = pd.concat([elo_history, pd.DataFrame(history_rows)], ignore_index=True)
-    storage.save("elo_history", elo_history)
     refresh_state()
 
+    updated_row = st.session_state.matches_df[st.session_state.matches_df["match_id"].astype(str) == str(match_id)].iloc[0]
+    apply_elo_for_match(match_id, winner, updated_row)
 
 def parse_date_str(raw: str) -> date:
     try:
@@ -715,7 +743,19 @@ with tab1:
                 match_time = create_cols[1].time_input("Match time")
                 video_url = st.text_input("YouTube video URL (optional)")
                 notes = st.text_area("Match notes", placeholder="Venue, lineup notes, injuries, tactics, anything useful")
-                create_match = st.form_submit_button("Create match")
+                create_mode = st.radio(
+                    "How do you want to save this match?",
+                    ["Create live match for annotation", "Save completed match with final score"],
+                    horizontal=False,
+                )
+                final_a_score = 0
+                final_b_score = 0
+                if create_mode == "Save completed match with final score":
+                    score_cols = st.columns(2)
+                    final_a_score = score_cols[0].number_input("Final Team A score", min_value=0, max_value=99, value=21)
+                    final_b_score = score_cols[1].number_input("Final Team B score", min_value=0, max_value=99, value=0)
+                    st.caption("This saves the result, updates Elo immediately, and lets you add annotations/clips later from the Matches page.")
+                create_match = st.form_submit_button("Save match")
 
                 if create_match:
                     require_editor()
@@ -724,20 +764,27 @@ with tab1:
                         st.error(f"{match_type} requires {expected} player(s) on each side.")
                     elif set(team_a) & set(team_b):
                         st.error("A player cannot be on both sides.")
+                    elif create_mode == "Save completed match with final score" and int(final_a_score) == int(final_b_score):
+                        st.error("Completed matches need a winner, so the final scores cannot be tied.")
                     else:
                         name_to_id = {row["name"]: str(row["player_id"]) for _, row in players_df.iterrows()}
+                        match_id_new = str(uuid4())
+                        is_completed = create_mode == "Save completed match with final score"
+                        winner = ""
+                        if is_completed:
+                            winner = "A" if int(final_a_score) > int(final_b_score) else "B"
                         row = {
-                            "match_id": str(uuid4()),
+                            "match_id": match_id_new,
                             "created_at": now_iso(),
-                            "completed_at": "",
+                            "completed_at": now_iso() if is_completed else "",
                             "match_type": match_type,
                             "points_to_win": int(points_to_win),
                             "team_a_players": "|".join(name_to_id[n] for n in team_a),
                             "team_b_players": "|".join(name_to_id[n] for n in team_b),
-                            "team_a_score": 0,
-                            "team_b_score": 0,
-                            "winner": "",
-                            "status": "In Progress",
+                            "team_a_score": int(final_a_score) if is_completed else 0,
+                            "team_b_score": int(final_b_score) if is_completed else 0,
+                            "winner": winner,
+                            "status": "Completed" if is_completed else "In Progress",
                             "video_url": (video_url or "").strip(),
                             "scheduled_date": str(match_date),
                             "scheduled_time": str(match_time),
@@ -747,7 +794,12 @@ with tab1:
                         participants_payload = pd.concat([st.session_state.match_participants_df, create_match_participants_rows(row["match_id"], parse_players(row["team_a_players"]), parse_players(row["team_b_players"]))], ignore_index=True)
                         storage.save("match_participants", participants_payload)
                         refresh_state()
-                        st.success("Match created.")
+                        if is_completed:
+                            created_match = st.session_state.matches_df[st.session_state.matches_df["match_id"].astype(str) == match_id_new].iloc[0]
+                            apply_elo_for_match(match_id_new, winner, created_match)
+                            st.success("Completed match saved and Elo updated. You can annotate it later from Matches.")
+                        else:
+                            st.success("Live match created.")
                         st.rerun()
     else:
         team_a_ids = get_match_team_ids(active_match, "A")
@@ -951,6 +1003,64 @@ with tab4:
         else:
             details_right.write("**Video:** —")
         st.write(f"**Notes:** {selected_match['notes'] or '—'}")
+
+        st.markdown("#### Add annotations to this match")
+        if current_role != "admin":
+            st.info("General Viewer mode: annotations are read-only.")
+        else:
+            ann_team_a_ids = get_match_team_ids(selected_match, "A")
+            ann_team_b_ids = get_match_team_ids(selected_match, "B")
+            ann_team_a_names = [players_lookup.get(pid, pid) for pid in ann_team_a_ids]
+            ann_team_b_names = [players_lookup.get(pid, pid) for pid in ann_team_b_ids]
+            ann_all_names = ann_team_a_names + ann_team_b_names
+
+            with st.form(f"annotate_match_{selected_match_id}"):
+                ann_cols = st.columns([1, 1, 1.2])
+                ann_start_raw = ann_cols[0].text_input("Clip start", placeholder="01:24", key=f"ann_start_{selected_match_id}")
+                ann_end_raw = ann_cols[1].text_input("Clip end", placeholder="01:31", key=f"ann_end_{selected_match_id}")
+                ann_event_type = ann_cols[2].selectbox(
+                    "Event type",
+                    ["good_shot", "bad_shot", "service_fault", "highlight", "point"],
+                    format_func=lambda x: x.replace("_", " ").title(),
+                    key=f"ann_type_{selected_match_id}",
+                )
+
+                ann_player_options = ["Team A (unattributed)", "Team B (unattributed)"] + ann_all_names
+                ann_player_choice = st.selectbox("Player / team", ann_player_options, key=f"ann_player_{selected_match_id}")
+                ann_note = st.text_input("Annotation note", placeholder="Optional note about the clip", key=f"ann_note_{selected_match_id}")
+                submitted_annotation = st.form_submit_button("Add annotation", use_container_width=True)
+
+                if submitted_annotation:
+                    require_editor()
+                    ann_start_seconds = parse_time_to_seconds(ann_start_raw)
+                    ann_end_seconds = parse_time_to_seconds(ann_end_raw)
+                    if ann_start_seconds is None or ann_end_seconds is None or ann_end_seconds < ann_start_seconds:
+                        st.error("Enter a valid clip start and end. Examples: 84, 01:24, 00:01:24")
+                    else:
+                        if ann_player_choice == "Team A (unattributed)":
+                            ann_team = "A"
+                            ann_pid = ""
+                        elif ann_player_choice == "Team B (unattributed)":
+                            ann_team = "B"
+                            ann_pid = ""
+                        else:
+                            ann_team = "A" if ann_player_choice in ann_team_a_names else "B"
+                            ann_pid = next((pid for pid, name in players_lookup.items() if name == ann_player_choice), "")
+
+                        points_awarded = 1 if ann_event_type == "point" else 0
+                        record_event(
+                            selected_match_id,
+                            ann_team,
+                            ann_pid,
+                            ann_event_type,
+                            points_awarded=points_awarded,
+                            note=ann_note,
+                            video_start_seconds=ann_start_seconds,
+                            video_end_seconds=ann_end_seconds,
+                            update_match_score=False,
+                        )
+                        st.success("Annotation added. Final score was not changed.")
+                        st.rerun()
 
         st.markdown("#### Event data")
         if selected_events.empty:
