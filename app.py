@@ -434,6 +434,101 @@ def apply_elo_for_match(match_id: str, winner: str, match_row: pd.Series | None 
         refresh_state()
 
 
+
+def _match_sort_key(row: pd.Series) -> pd.Timestamp:
+    date_part = str(row.get("scheduled_date", "") or "").strip()
+    time_part = str(row.get("scheduled_time", "") or "").strip()
+    candidates = []
+    if date_part:
+        candidates.append(f"{date_part} {time_part}".strip())
+    candidates.extend([
+        str(row.get("completed_at", "") or "").strip(),
+        str(row.get("created_at", "") or "").strip(),
+    ])
+    for candidate in candidates:
+        if not candidate:
+            continue
+        parsed = pd.to_datetime(candidate, errors="coerce")
+        if not pd.isna(parsed):
+            return parsed
+    return pd.Timestamp.max
+
+
+def recalculate_elo_history() -> int:
+    require_editor()
+
+    completed_matches = st.session_state.matches_df.copy()
+    if completed_matches.empty:
+        storage.save("elo_history", pd.DataFrame(columns=DATA_FILES["elo_history"]))
+        refresh_state()
+        return 0
+
+    completed_matches = completed_matches[
+        completed_matches["status"].astype(str).str.lower().eq("completed")
+        & completed_matches["winner"].astype(str).isin(["A", "B"])
+    ].copy()
+
+    if completed_matches.empty:
+        storage.save("elo_history", pd.DataFrame(columns=DATA_FILES["elo_history"]))
+        refresh_state()
+        return 0
+
+    completed_matches["_elo_sort_key"] = completed_matches.apply(_match_sort_key, axis=1)
+    completed_matches = completed_matches.sort_values(["_elo_sort_key", "created_at", "match_id"])
+
+    elo_map = {str(row["player_id"]): BASE_ELO for _, row in st.session_state.players_df.iterrows()}
+    rebuilt_rows: list[dict] = []
+
+    for _, match_row in completed_matches.iterrows():
+        match_id = str(match_row.get("match_id", "") or "").strip()
+        winner = str(match_row.get("winner", "") or "").strip()
+        team_a_ids = get_match_team_ids(match_row, "A")
+        team_b_ids = get_match_team_ids(match_row, "B")
+        if not match_id or winner not in {"A", "B"} or not team_a_ids or not team_b_ids:
+            continue
+
+        team_a_old = [elo_map.get(pid, BASE_ELO) for pid in team_a_ids]
+        team_b_old = [elo_map.get(pid, BASE_ELO) for pid in team_b_ids]
+        team_a_new, team_b_new = update_team_elos(team_a_old, team_b_old, winner)
+        recorded_at = str(match_row.get("completed_at", "") or "").strip() or str(match_row.get("created_at", "") or "").strip() or now_iso()
+
+        for pid, old, new in zip(team_a_ids, team_a_old, team_a_new):
+            old_i = int(round(old))
+            new_i = int(round(new))
+            rebuilt_rows.append({
+                "history_id": str(uuid4()),
+                "match_id": match_id,
+                "player_id": pid,
+                "old_elo": old_i,
+                "new_elo": new_i,
+                "delta": new_i - old_i,
+                "recorded_at": recorded_at,
+                "elo_model_version": ELO_MODEL_VERSION,
+                "k_factor_used": int(round(K_FACTOR)),
+            })
+            elo_map[pid] = new_i
+
+        for pid, old, new in zip(team_b_ids, team_b_old, team_b_new):
+            old_i = int(round(old))
+            new_i = int(round(new))
+            rebuilt_rows.append({
+                "history_id": str(uuid4()),
+                "match_id": match_id,
+                "player_id": pid,
+                "old_elo": old_i,
+                "new_elo": new_i,
+                "delta": new_i - old_i,
+                "recorded_at": recorded_at,
+                "elo_model_version": ELO_MODEL_VERSION,
+                "k_factor_used": int(round(K_FACTOR)),
+            })
+            elo_map[pid] = new_i
+
+    rebuilt = pd.DataFrame(rebuilt_rows, columns=DATA_FILES["elo_history"])
+    storage.save("elo_history", rebuilt)
+    refresh_state()
+    return len(completed_matches)
+
 def complete_match(match_id: str) -> None:
     matches = st.session_state.matches_df.copy()
     idx = matches.index[matches["match_id"].astype(str) == str(match_id)]
@@ -717,8 +812,8 @@ stats_df = build_player_stats(players_df, matches_df, events_df, elo_history_df,
 review_df = build_event_review_df(events_df, matches_df, players_lookup)
 render_top_summary(players_df, matches_df, review_df)
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
-    "🎬 Live Match", "🏅 Elo", "📊 Stats", "🗂️ Matches", "✅ Good Shots", "❌ Bad Shots", "⭐ Highlights", "🧍 Player Explorer", "📅 Match History"
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
+    "🎬 Live Match", "🏅 Elo", "📊 Stats", "🗂️ Matches", "✅ Good Shots", "❌ Bad Shots", "⭐ Highlights", "🧍 Player Explorer", "📅 Match History", "🛠️ Admin"
 ])
 
 with tab1:
@@ -1123,3 +1218,22 @@ with tab9:
             completed["played_on"] = completed["scheduled_date"].replace("", pd.NA).fillna(completed["completed_at"].astype(str).str[:10])
             match_chart = px.histogram(completed, x="played_on", title="Matches completed over time")
             st.plotly_chart(match_chart, use_container_width=True)
+
+
+with tab10:
+    st.subheader("Admin tools")
+    if current_role != "admin":
+        st.info("General Viewer mode: admin tools are hidden.")
+    else:
+        st.markdown("### Recalculate Elo")
+        st.write("Use this after deleting duplicate matches or changing match results. It clears Elo history and rebuilds it from completed matches in chronological order.")
+        completed_count = int(matches_df[
+            matches_df["status"].astype(str).str.lower().eq("completed")
+            & matches_df["winner"].astype(str).isin(["A", "B"])
+        ].shape[0]) if not matches_df.empty else 0
+        st.caption(f"Completed matches eligible for Elo rebuild: {completed_count}")
+        confirm_recalc = st.checkbox("I understand this will replace the existing Elo history", key="confirm_recalculate_elo")
+        if st.button("Recalculate Elo from completed matches", disabled=not confirm_recalc, type="primary", use_container_width=True):
+            processed = recalculate_elo_history()
+            st.success(f"Elo recalculated from {processed} completed match(es).")
+            st.rerun()
