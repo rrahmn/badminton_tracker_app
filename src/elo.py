@@ -3,8 +3,8 @@ from __future__ import annotations
 from typing import Iterable
 
 BASE_ELO = 1000
-K_FACTOR = 32
-ELO_MODEL_VERSION = "team_average_v1"
+K_FACTOR = 16
+ELO_MODEL_VERSION = "team_average_v2"
 
 
 def expected_score(rating_a: float, rating_b: float) -> float:
