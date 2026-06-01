@@ -8,9 +8,11 @@ from uuid import uuid4
 
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 
 from src.auth import auth_is_configured, get_display_name, get_role, logout, require_editor, require_login
+from src.analytics import build_elo_timeline_df, build_partner_matrix_df, build_player_relationship_insights
 from src.elo import BASE_ELO, ELO_MODEL_VERSION, K_FACTOR, update_team_elos
 from src.stats import build_player_stats, current_elo_map
 from src.storage import CSVStorage, SupabaseStorage, DATA_FILES
@@ -666,6 +668,188 @@ def render_event_review_page(title: str, review_df: pd.DataFrame, event_type: st
     )
 
 
+
+def render_elo_history_page(players_df: pd.DataFrame, matches_df: pd.DataFrame, elo_history_df: pd.DataFrame, stats_df: pd.DataFrame, players_lookup: dict[str, str]) -> None:
+    st.subheader("Elo leaderboard & history")
+    if stats_df.empty:
+        st.info("Add players and complete matches to see Elo.")
+        return
+
+    leaderboard = stats_df[["name", "elo", "matches_played", "wins", "losses", "win_rate"]].copy()
+    top_cols = st.columns([1.1, 1.4])
+    with top_cols[0]:
+        st.markdown("#### Current leaderboard")
+        st.dataframe(leaderboard.sort_values("elo", ascending=False), use_container_width=True, hide_index=True)
+    with top_cols[1]:
+        elo_bar = px.bar(
+            leaderboard.sort_values("elo", ascending=True),
+            x="elo",
+            y="name",
+            orientation="h",
+            title="Current Elo by player",
+            labels={"elo": "Current Elo", "name": "Player"},
+        )
+        elo_bar.update_layout(height=360, margin=dict(l=10, r=10, t=50, b=10))
+        st.plotly_chart(elo_bar, use_container_width=True)
+
+    st.markdown("#### Elo history")
+    matches_view = add_match_display_columns(matches_df, players_lookup)
+    timeline = build_elo_timeline_df(matches_view, elo_history_df, players_lookup)
+    if timeline.empty:
+        st.info("No Elo history yet. Complete a match to start building the timeline.")
+        return
+
+    player_options = sorted(timeline["player"].dropna().astype(str).unique().tolist())
+    default_players = player_options[: min(8, len(player_options))]
+    selected_players = st.multiselect(
+        "Show players",
+        player_options,
+        default=default_players,
+        help="Filter players in or out to keep the chart readable.",
+    )
+    filtered = timeline[timeline["player"].isin(selected_players)].copy() if selected_players else timeline.iloc[0:0].copy()
+    if filtered.empty:
+        st.info("Select at least one player to show the Elo line chart.")
+        return
+
+    fig = go.Figure()
+    x_title = "Match date / Elo update time"
+    for player_name, group in filtered.groupby("player", sort=True):
+        group = group.sort_values(["recorded_at_dt", "recorded_at", "match_id"])
+        x_values = group["recorded_at_dt"].fillna(pd.to_datetime(group["recorded_at"], errors="coerce"))
+        if x_values.isna().all():
+            x_values = list(range(1, len(group) + 1))
+            x_title = "Elo event order"
+        fig.add_trace(
+            go.Scatter(
+                x=x_values,
+                y=group["new_elo"],
+                mode="lines+markers",
+                name=player_name,
+                customdata=group[["hover_details", "match_id"]],
+                hovertemplate="%{customdata[0]}<extra></extra>",
+                marker=dict(size=8, line=dict(width=1)),
+            )
+        )
+    fig.update_layout(
+        title="Elo movement over time",
+        xaxis_title=x_title,
+        yaxis_title="Elo rating",
+        hovermode="closest",
+        legend_title="Player",
+        height=520,
+        margin=dict(l=20, r=20, t=60, b=20),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+    st.caption("Hover over a marker to see the match, score, winner and Elo change. Streamlit does not natively open pages from Plotly clicks, so use the selector below to inspect the exact match.")
+
+    event_options = filtered.sort_values(["recorded_at_dt", "recorded_at", "player"], ascending=[False, False, True]).copy()
+    event_options["elo_event_label"] = event_options.apply(
+        lambda r: f"{r.get('player', '')}: {r.get('delta_label', '')} Elo | {r.get('match_date_label', '')} | {r.get('team_a_names', '')} vs {r.get('team_b_names', '')} | {r.get('score_label', '')}",
+        axis=1,
+    )
+    selected_event = st.selectbox("Inspect Elo event / match", event_options["elo_event_label"].tolist(), key="elo_event_inspector")
+    if selected_event:
+        event_row = event_options[event_options["elo_event_label"] == selected_event].iloc[0]
+        st.markdown("##### Selected match summary")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Player Elo change", str(event_row.get("delta_label", "")))
+        c2.metric("New Elo", f"{float(event_row.get('new_elo', BASE_ELO)):.0f}")
+        c3.metric("Score", str(event_row.get("score_label", "")))
+        c4.metric("Winner", str(event_row.get("winner_label", "—") or "—"))
+        st.write(f"**Match:** {event_row.get('team_a_names', '')} vs {event_row.get('team_b_names', '')}")
+        if str(event_row.get("video_url", "") or "").strip():
+            st.markdown(f"**Video:** [Open video]({event_row.get('video_url')})")
+        st.write(f"**Notes:** {event_row.get('notes', '') or '—'}")
+
+
+def render_partner_matrix_page(players_df: pd.DataFrame, matches_df: pd.DataFrame, participants_df: pd.DataFrame, elo_history_df: pd.DataFrame, players_lookup: dict[str, str]) -> None:
+    st.subheader("Partner evaluation matrix")
+    st.caption("Rows show the player being evaluated. Columns show their doubles partner. The cell colour is the net Elo change for the row player when paired with that partner.")
+    matrix_df = build_partner_matrix_df(matches_df, participants_df, elo_history_df, players_lookup)
+    if matrix_df.empty:
+        st.info("No doubles partner data yet. Complete doubles matches to build this matrix.")
+        return
+
+    players = sorted(set(matrix_df["player"].dropna().astype(str).tolist()) | set(matrix_df["partner"].dropna().astype(str).tolist()))
+    selected = st.multiselect("Players to include", players, default=players[: min(12, len(players))])
+    filtered = matrix_df[matrix_df["player"].isin(selected) & matrix_df["partner"].isin(selected)].copy() if selected else matrix_df.iloc[0:0].copy()
+    if filtered.empty:
+        st.info("Select at least two players with completed doubles matches together.")
+        return
+
+    z = filtered.pivot(index="player", columns="partner", values="net_elo").reindex(index=selected, columns=selected)
+    hover = filtered.pivot(index="player", columns="partner", values="hover").reindex(index=selected, columns=selected)
+    for same in set(z.index).intersection(set(z.columns)):
+        z.loc[same, same] = None
+        hover.loc[same, same] = ""
+
+    max_abs = float(pd.to_numeric(filtered["net_elo"], errors="coerce").abs().max() or 1)
+    fig = go.Figure(data=go.Heatmap(
+        z=z.values,
+        x=z.columns.tolist(),
+        y=z.index.tolist(),
+        text=hover.values,
+        hovertemplate="%{text}<extra></extra>",
+        colorscale="RdYlGn",
+        zmid=0,
+        zmin=-max_abs,
+        zmax=max_abs,
+        colorbar=dict(title="Net Elo"),
+    ))
+    fig.update_layout(
+        title="Doubles partner impact on Elo",
+        xaxis_title="Partner",
+        yaxis_title="Player",
+        height=max(520, 42 * len(z.index)),
+        margin=dict(l=80, r=20, t=70, b=80),
+    )
+    fig.update_xaxes(side="top")
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("#### Partner detail table")
+    table = filtered.copy().sort_values(["player", "net_elo"], ascending=[True, False])
+    st.dataframe(
+        table[["player", "partner", "matches", "wins", "losses", "win_rate", "elo_gained", "elo_lost_abs", "net_elo"]],
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "win_rate": st.column_config.NumberColumn("Win rate %", format="%.1f"),
+            "elo_gained": st.column_config.NumberColumn("Elo gained", format="+%.0f"),
+            "elo_lost_abs": st.column_config.NumberColumn("Elo lost", format="%.0f"),
+            "net_elo": st.column_config.NumberColumn("Net Elo", format="%+.0f"),
+        },
+    )
+
+
+def render_player_relationship_highlights(selected_pid: str, matches_df: pd.DataFrame, participants_df: pd.DataFrame, elo_history_df: pd.DataFrame, players_lookup: dict[str, str]) -> None:
+    insights = build_player_relationship_insights(selected_pid, matches_df, participants_df, elo_history_df, players_lookup)
+    st.markdown("#### Relationship highlights")
+    c1, c2, c3 = st.columns(3)
+    worst = insights.get("worst_opponent")
+    if worst:
+        c1.metric("Lost most Elo against", str(worst.get("name", "—")), f"-{float(worst.get('elo_lost_abs', 0)):.0f} Elo")
+        c1.caption(f"Across {int(worst.get('matches', 0))} match(es).")
+    else:
+        c1.metric("Lost most Elo against", "—")
+        c1.caption("No negative opponent Elo impact yet.")
+
+    best_partner = insights.get("best_partner")
+    if best_partner:
+        c2.metric("Best Elo partner", str(best_partner.get("name", "—")), f"+{float(best_partner.get('net_elo', 0)):.0f} Elo")
+        c2.caption(f"Win rate {float(best_partner.get('win_rate', 0)):.1f}% over {int(best_partner.get('matches', 0))} match(es).")
+    else:
+        c2.metric("Best Elo partner", "—")
+        c2.caption("No positive partner Elo impact yet.")
+
+    best_wr = insights.get("best_partner_win_rate")
+    if best_wr:
+        c3.metric("Best partner win rate", str(best_wr.get("name", "—")), f"{float(best_wr.get('win_rate', 0)):.1f}%")
+        c3.caption(f"{int(best_wr.get('wins', 0))}/{int(best_wr.get('matches', 0))} wins, net {float(best_wr.get('net_elo', 0)):+.0f} Elo.")
+    else:
+        c3.metric("Best partner win rate", "—")
+        c3.caption("No doubles partner history yet.")
+
 def render_player_explorer(players_df: pd.DataFrame, stats_df: pd.DataFrame, review_df: pd.DataFrame, matches_df: pd.DataFrame, players_lookup: dict[str, str]) -> None:
     st.subheader("Player Explorer")
     if players_df.empty:
@@ -693,6 +877,8 @@ def render_player_explorer(players_df: pd.DataFrame, stats_df: pd.DataFrame, rev
         metric_cols[3].metric("Points", int(stat_row["points_won"]))
         metric_cols[4].metric("Good / Bad", f"{int(stat_row['good_shots'])} / {int(stat_row['bad_shots'])}")
         metric_cols[5].metric("Highlights", int(stat_row["highlights"]))
+
+    render_player_relationship_highlights(selected_pid, matches_df, match_participants_df, elo_history_df, players_lookup)
 
     player_events = review_df[review_df["player_id"].astype(str) == selected_pid].copy() if not review_df.empty else pd.DataFrame()
     if not match_participants_df.empty:
@@ -812,8 +998,8 @@ stats_df = build_player_stats(players_df, matches_df, events_df, elo_history_df,
 review_df = build_event_review_df(events_df, matches_df, players_lookup)
 render_top_summary(players_df, matches_df, review_df)
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10 = st.tabs([
-    "🎬 Live Match", "🏅 Elo", "📊 Stats", "🗂️ Matches", "✅ Good Shots", "❌ Bad Shots", "⭐ Highlights", "🧍 Player Explorer", "📅 Match History", "🛠️ Admin"
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs([
+    "🎬 Live Match", "🏅 Elo", "📊 Stats", "🤝 Partners", "🗂️ Matches", "✅ Good Shots", "❌ Bad Shots", "⭐ Highlights", "🧍 Player Explorer", "📅 Match History", "🛠️ Admin"
 ])
 
 with tab1:
@@ -827,7 +1013,17 @@ with tab1:
         elif current_role != "admin":
             st.info("General Viewer mode: only admins can create matches.")
         else:
-            with st.form("create_match_form"):
+            create_mode = st.radio(
+                "How do you want to save this match?",
+                ["Create live match for annotation", "Save completed match with final score"],
+                horizontal=False,
+                key="create_match_mode",
+                help="Choose completed match first if you already know the final score. The score boxes will appear before you save.",
+            )
+            if create_mode == "Save completed match with final score":
+                st.info("Enter the final score below. This will save the result, update Elo immediately, and still let you annotate clips later from Matches.")
+
+            with st.form("create_match_form", clear_on_submit=False):
                 match_type = st.selectbox("Match type", ["Singles", "Doubles"])
                 points_to_win = st.number_input("Points to win", min_value=1, max_value=99, value=21)
                 names = players_df["name"].sort_values().tolist()
@@ -838,19 +1034,18 @@ with tab1:
                 match_time = create_cols[1].time_input("Match time")
                 video_url = st.text_input("YouTube video URL (optional)")
                 notes = st.text_area("Match notes", placeholder="Venue, lineup notes, injuries, tactics, anything useful")
-                create_mode = st.radio(
-                    "How do you want to save this match?",
-                    ["Create live match for annotation", "Save completed match with final score"],
-                    horizontal=False,
-                )
                 final_a_score = 0
                 final_b_score = 0
                 if create_mode == "Save completed match with final score":
                     score_cols = st.columns(2)
-                    final_a_score = score_cols[0].number_input("Final Team A score", min_value=0, max_value=99, value=21)
-                    final_b_score = score_cols[1].number_input("Final Team B score", min_value=0, max_value=99, value=0)
-                    st.caption("This saves the result, updates Elo immediately, and lets you add annotations/clips later from the Matches page.")
-                create_match = st.form_submit_button("Save match")
+                    final_a_score = score_cols[0].number_input("Final Team A score", min_value=0, max_value=99, value=21, key="final_team_a_score")
+                    final_b_score = score_cols[1].number_input("Final Team B score", min_value=0, max_value=99, value=0, key="final_team_b_score")
+                create_match = st.form_submit_button("Save match", type="primary")
+
+                if not create_match:
+                    # Reset the guard once the form is no longer actively submitting. This lets
+                    # admins create another match later, but protects the first submit/rerun cycle.
+                    st.session_state["create_match_submit_in_progress"] = False
 
                 if create_match:
                     require_editor()
@@ -862,6 +1057,27 @@ with tab1:
                     elif create_mode == "Save completed match with final score" and int(final_a_score) == int(final_b_score):
                         st.error("Completed matches need a winner, so the final scores cannot be tied.")
                     else:
+                        create_signature = "|".join([
+                            str(match_type),
+                            str(points_to_win),
+                            "~".join(sorted(team_a)),
+                            "~".join(sorted(team_b)),
+                            str(match_date),
+                            str(match_time),
+                            (video_url or "").strip(),
+                            (notes or "").strip(),
+                            str(create_mode),
+                            str(int(final_a_score)) if create_mode == "Save completed match with final score" else "",
+                            str(int(final_b_score)) if create_mode == "Save completed match with final score" else "",
+                        ])
+
+                        if st.session_state.get("create_match_submit_in_progress") and st.session_state.get("last_create_match_signature") == create_signature:
+                            st.warning("Duplicate submit ignored. The match was already saved.")
+                            st.stop()
+
+                        st.session_state["create_match_submit_in_progress"] = True
+                        st.session_state["last_create_match_signature"] = create_signature
+
                         name_to_id = {row["name"]: str(row["player_id"]) for _, row in players_df.iterrows()}
                         match_id_new = str(uuid4())
                         is_completed = create_mode == "Save completed match with final score"
@@ -1041,14 +1257,7 @@ with tab1:
             )
 
 with tab2:
-    st.subheader("Players & Elo")
-    if stats_df.empty:
-        st.info("Add players and complete matches to see Elo.")
-    else:
-        leaderboard = stats_df[["name", "elo", "matches_played", "wins", "losses", "win_rate"]].copy()
-        st.dataframe(leaderboard, use_container_width=True, hide_index=True)
-        elo_chart = px.bar(leaderboard.sort_values("elo", ascending=False), x="name", y="elo", title="Current Elo")
-        st.plotly_chart(elo_chart, use_container_width=True)
+    render_elo_history_page(players_df, matches_df, elo_history_df, stats_df, players_lookup)
 
 with tab3:
     st.subheader("Player Stats")
@@ -1062,6 +1271,9 @@ with tab3:
         st.plotly_chart(stat_chart, use_container_width=True)
 
 with tab4:
+    render_partner_matrix_page(players_df, matches_df, match_participants_df, elo_history_df, players_lookup)
+
+with tab5:
     st.subheader("Matches")
     matches_view = add_match_display_columns(matches_df, players_lookup)
     if matches_view.empty:
@@ -1183,20 +1395,20 @@ with tab4:
                 mime="text/csv",
             )
 
-with tab5:
+with tab6:
     render_event_review_page("Good Shots", review_df, "good_shot", players_lookup)
 
-with tab6:
+with tab7:
     render_event_review_page("Bad Shots", review_df, "bad_shot", players_lookup)
 
-with tab7:
+with tab8:
     render_event_review_page("Highlights", review_df, "highlight", players_lookup)
 
-with tab8:
+with tab9:
     render_player_explorer(players_df, stats_df, review_df, matches_df, players_lookup)
 
 
-with tab9:
+with tab10:
     st.subheader("Match History")
     history = matches_df.copy()
     if history.empty:
@@ -1220,7 +1432,7 @@ with tab9:
             st.plotly_chart(match_chart, use_container_width=True)
 
 
-with tab10:
+with tab11:
     st.subheader("Admin tools")
     if current_role != "admin":
         st.info("General Viewer mode: admin tools are hidden.")
