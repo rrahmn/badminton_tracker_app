@@ -945,6 +945,23 @@ def render_elo_history_page(players_df: pd.DataFrame, matches_df: pd.DataFrame, 
         st.info("No Elo history yet. Complete a match to start building the timeline.")
         return
 
+    # Defensive fallback: older analytics.py versions may not create these chart columns.
+    # Keep the app running and still use match dates on the x-axis.
+    if "recorded_at_dt" not in timeline.columns:
+        timeline["recorded_at_dt"] = pd.to_datetime(timeline.get("recorded_at", ""), errors="coerce")
+    if "match_date_dt" not in timeline.columns:
+        timeline["match_date_dt"] = pd.to_datetime(timeline.get("scheduled_date", ""), errors="coerce")
+        timeline["match_date_dt"] = timeline["match_date_dt"].fillna(timeline["recorded_at_dt"].dt.normalize())
+    if "chart_x_dt" not in timeline.columns:
+        order = timeline[["match_id", "match_date_dt", "recorded_at_dt"]].drop_duplicates("match_id").copy()
+        order = order.sort_values(["match_date_dt", "recorded_at_dt", "match_id"])
+        order["date_group"] = order["match_date_dt"].dt.date.astype(str)
+        order["day_order"] = order.groupby("date_group").cumcount()
+        order["day_count"] = order.groupby("date_group")["match_id"].transform("count")
+        order["spread_minutes"] = 120 + ((order["day_order"] + 1) * (20 * 60 / (order["day_count"] + 1)))
+        order["chart_x_dt"] = order["match_date_dt"].dt.normalize() + pd.to_timedelta(order["spread_minutes"], unit="m")
+        timeline = timeline.merge(order[["match_id", "chart_x_dt"]], on="match_id", how="left")
+
     player_options = sorted(timeline["player"].dropna().astype(str).unique().tolist())
     default_players = player_options[: min(8, len(player_options))]
     selected_players = st.multiselect(
