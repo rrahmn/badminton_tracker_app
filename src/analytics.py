@@ -136,6 +136,9 @@ def build_partner_matrix_df(matches_df: pd.DataFrame, participants_df: pd.DataFr
     )
     out["losses"] = out["matches"] - out["wins"]
     out["win_rate"] = (out["wins"] / out["matches"] * 100).round(1)
+    out["avg_net_elo"] = (out["net_elo"] / out["matches"]).round(2)
+    out["avg_elo_gained"] = (out["elo_gained"] / out["matches"]).round(2)
+    out["avg_elo_lost"] = (out["elo_lost"].abs() / out["matches"]).round(2)
     out["elo_lost_abs"] = out["elo_lost"].abs()
     out["hover"] = out.apply(
         lambda r: (
@@ -143,9 +146,10 @@ def build_partner_matrix_df(matches_df: pd.DataFrame, participants_df: pd.DataFr
             f"Matches: {int(r['matches'])}<br>"
             f"Win rate: {float(r['win_rate']):.1f}%<br>"
             f"Wins/Losses: {int(r['wins'])}/{int(r['losses'])}<br>"
-            f"Net Elo for {r['player']}: {float(r['net_elo']):+.0f}<br>"
-            f"Elo gained: +{float(r['elo_gained']):.0f}<br>"
-            f"Elo lost: -{float(r['elo_lost_abs']):.0f}"
+            f"Avg Elo / match for {r['player']}: {float(r['avg_net_elo']):+.1f}<br>"
+            f"Net Elo: {float(r['net_elo']):+.0f}<br>"
+            f"Elo gained: +{float(r['elo_gained']):.0f} total / +{float(r['avg_elo_gained']):.1f} avg<br>"
+            f"Elo lost: -{float(r['elo_lost_abs']):.0f} total / -{float(r['avg_elo_lost']):.1f} avg"
         ),
         axis=1,
     )

@@ -1028,7 +1028,7 @@ def render_elo_history_page(players_df: pd.DataFrame, matches_df: pd.DataFrame, 
 
 def render_partner_matrix_page(players_df: pd.DataFrame, matches_df: pd.DataFrame, participants_df: pd.DataFrame, elo_history_df: pd.DataFrame, players_lookup: dict[str, str]) -> None:
     st.subheader("Partner evaluation matrix")
-    st.caption("Rows show the player being evaluated. Columns show their doubles partner. The cell colour is the net Elo change for the row player when paired with that partner.")
+    st.caption("Rows show the player being evaluated. Columns show their doubles partner. The cell colour is the average net Elo change per match for the row player when paired with that partner.")
     matrix_df = build_partner_matrix_df(matches_df, participants_df, elo_history_df, players_lookup)
     if matrix_df.empty:
         st.info("No doubles partner data yet. Complete doubles matches to build this matrix.")
@@ -1041,13 +1041,13 @@ def render_partner_matrix_page(players_df: pd.DataFrame, matches_df: pd.DataFram
         st.info("Select at least two players with completed doubles matches together.")
         return
 
-    z = filtered.pivot(index="player", columns="partner", values="net_elo").reindex(index=selected, columns=selected)
+    z = filtered.pivot(index="player", columns="partner", values="avg_net_elo").reindex(index=selected, columns=selected)
     hover = filtered.pivot(index="player", columns="partner", values="hover").reindex(index=selected, columns=selected)
     for same in set(z.index).intersection(set(z.columns)):
         z.loc[same, same] = None
         hover.loc[same, same] = ""
 
-    max_abs = float(pd.to_numeric(filtered["net_elo"], errors="coerce").abs().max() or 1)
+    max_abs = float(pd.to_numeric(filtered["avg_net_elo"], errors="coerce").abs().max() or 1)
     fig = go.Figure(data=go.Heatmap(
         z=z.values,
         x=z.columns.tolist(),
@@ -1058,10 +1058,10 @@ def render_partner_matrix_page(players_df: pd.DataFrame, matches_df: pd.DataFram
         zmid=0,
         zmin=-max_abs,
         zmax=max_abs,
-        colorbar=dict(title="Net Elo"),
+        colorbar=dict(title="Avg Elo / match"),
     ))
     fig.update_layout(
-        title="Doubles partner impact on Elo",
+        title="Doubles partner impact on Elo per match",
         xaxis_title="Partner",
         yaxis_title="Player",
         height=max(520, 42 * len(z.index)),
@@ -1071,16 +1071,19 @@ def render_partner_matrix_page(players_df: pd.DataFrame, matches_df: pd.DataFram
     st.plotly_chart(fig, use_container_width=True)
 
     st.markdown("#### Partner detail table")
-    table = filtered.copy().sort_values(["player", "net_elo"], ascending=[True, False])
+    table = filtered.copy().sort_values(["player", "avg_net_elo"], ascending=[True, False])
     st.dataframe(
-        table[["player", "partner", "matches", "wins", "losses", "win_rate", "elo_gained", "elo_lost_abs", "net_elo"]],
+        table[["player", "partner", "matches", "wins", "losses", "win_rate", "avg_net_elo", "avg_elo_gained", "avg_elo_lost", "elo_gained", "elo_lost_abs", "net_elo"]],
         use_container_width=True,
         hide_index=True,
         column_config={
             "win_rate": st.column_config.NumberColumn("Win rate %", format="%.1f"),
-            "elo_gained": st.column_config.NumberColumn("Elo gained", format="+%.0f"),
-            "elo_lost_abs": st.column_config.NumberColumn("Elo lost", format="%.0f"),
-            "net_elo": st.column_config.NumberColumn("Net Elo", format="%+.0f"),
+            "avg_net_elo": st.column_config.NumberColumn("Avg net Elo / match", format="%+.1f"),
+            "avg_elo_gained": st.column_config.NumberColumn("Avg Elo gained / match", format="+%.1f"),
+            "avg_elo_lost": st.column_config.NumberColumn("Avg Elo lost / match", format="%.1f"),
+            "elo_gained": st.column_config.NumberColumn("Total Elo gained", format="+%.0f"),
+            "elo_lost_abs": st.column_config.NumberColumn("Total Elo lost", format="%.0f"),
+            "net_elo": st.column_config.NumberColumn("Total net Elo", format="%+.0f"),
         },
     )
 
