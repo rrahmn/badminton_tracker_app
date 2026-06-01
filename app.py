@@ -8,12 +8,13 @@ from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 from uuid import uuid4
 
 import pandas as pd
+import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
 from src.auth import auth_is_configured, get_display_name, get_role, logout, require_editor, require_login
-from src.analytics import build_elo_timeline_df, build_partner_matrix_df, build_player_relationship_insights
+from src.analytics import build_elo_timeline_df, build_partner_matrix_df, build_player_relationship_insights, build_player_loss_risk_df, build_player_head_to_head_df, build_player_match_timeline_df, build_player_clutch_summary_df, build_player_context_setup_options, build_replacement_benchmark_df, summarise_replacement_benchmark
 from src.elo import BASE_ELO, ELO_MODEL_VERSION, K_FACTOR, update_team_elos
 from src.stats import build_player_stats, current_elo_map
 from src.storage import CSVStorage, SupabaseStorage, DATA_FILES
@@ -1116,6 +1117,497 @@ def render_player_relationship_highlights(selected_pid: str, matches_df: pd.Data
         c3.metric("Best partner win rate", "—")
         c3.caption("No doubles partner history yet.")
 
+
+
+def _build_loss_risk_surface(risk_df: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray, float, float]:
+    """Create a smooth IDW surface for the player's doubles score-performance chart."""
+    x = pd.to_numeric(risk_df["x_partner_relative_elo"], errors="coerce").to_numpy(dtype=float)
+    y = pd.to_numeric(risk_df["y_opponent_relative_elo"], errors="coerce").to_numpy(dtype=float)
+    z_col = "score_performance_pp" if "score_performance_pp" in risk_df.columns else "loss_risk_pp"
+    z = pd.to_numeric(risk_df[z_col], errors="coerce").to_numpy(dtype=float)
+    valid = ~(np.isnan(x) | np.isnan(y) | np.isnan(z))
+    x, y, z = x[valid], y[valid], z[valid]
+
+    if len(x) == 0:
+        axis_limit = 200.0
+        max_abs_z = 10.0
+        grid_axis = np.linspace(-axis_limit, axis_limit, 45)
+        xx, yy = np.meshgrid(grid_axis, grid_axis)
+        zz = np.zeros_like(xx)
+        return xx, yy, zz, axis_limit, max_abs_z
+
+    axis_limit = max(100.0, float(np.nanmax(np.abs(np.concatenate([x, y])))) + 40.0)
+    axis_limit = min(max(axis_limit, 160.0), 500.0)
+    grid_axis = np.linspace(-axis_limit, axis_limit, 70)
+    xx, yy = np.meshgrid(grid_axis, grid_axis)
+
+    if len(x) == 1:
+        zz = np.full_like(xx, z[0], dtype=float)
+    else:
+        # Inverse-distance weighting: nearby historical matches influence the colour more.
+        dx = xx[..., None] - x[None, None, :]
+        dy = yy[..., None] - y[None, None, :]
+        dist_sq = dx * dx + dy * dy
+        weights = 1.0 / np.power(dist_sq + 900.0, 1.15)
+        zz = np.sum(weights * z[None, None, :], axis=2) / np.sum(weights, axis=2)
+
+    max_abs_z = max(5.0, float(np.nanmax(np.abs(z))))
+    return xx, yy, zz, axis_limit, max_abs_z
+
+
+def render_player_loss_risk_heatmap(
+    selected_pid: str,
+    selected_name: str,
+    matches_df: pd.DataFrame,
+    participants_df: pd.DataFrame,
+    elo_history_df: pd.DataFrame,
+    players_lookup: dict[str, str],
+) -> None:
+    st.markdown("#### Performance map: better or worse than expected")
+    timeline = build_player_match_timeline_df(selected_pid, matches_df, participants_df, elo_history_df, players_lookup)
+    if timeline.empty:
+        st.info("No completed match performance map yet for this player.")
+        return
+
+    chart_df = timeline.copy()
+    chart_df["result_symbol"] = chart_df["result"].map({"Win": "circle", "Loss": "x"}).fillna("circle")
+    chart_df["elo_impact_size"] = chart_df["elo_delta"].abs().clip(lower=6, upper=28) + 8
+    chart_df["performance_band"] = pd.cut(
+        chart_df["score_performance_pp"],
+        bins=[-999, -10, -3, 3, 10, 999],
+        labels=["Major underperformance", "Slight underperformance", "About expected", "Slight overperformance", "Major overperformance"],
+    ).astype(str)
+
+    max_x = max(100.0, float(chart_df["opponent_relative_elo"].abs().max() or 0) + 40)
+    max_y = max(18.0, float(chart_df["score_performance_pp"].abs().max() or 0) + 5)
+    max_y = min(max_y, 50.0)
+    max_color = max(12.0, float(chart_df["score_performance_pp"].abs().max() or 0))
+
+    st.caption(
+        "Each dot is one match. Up = you scored better than Elo expected. Down = you scored worse than Elo expected. "
+        "Right = harder match against stronger opponents. Left = easier match where you were favoured. "
+        "Circle = win, X = loss, bigger marker = bigger Elo swing."
+    )
+
+    fig = go.Figure()
+
+    # Background quadrant shading, deliberately subtle and labelled in plain English.
+    fig.add_shape(type="rect", x0=-max_x, x1=0, y0=0, y1=max_y, fillcolor="rgba(46, 204, 113, 0.10)", line_width=0, layer="below")
+    fig.add_shape(type="rect", x0=0, x1=max_x, y0=0, y1=max_y, fillcolor="rgba(0, 128, 0, 0.13)", line_width=0, layer="below")
+    fig.add_shape(type="rect", x0=-max_x, x1=0, y0=-max_y, y1=0, fillcolor="rgba(231, 76, 60, 0.15)", line_width=0, layer="below")
+    fig.add_shape(type="rect", x0=0, x1=max_x, y0=-max_y, y1=0, fillcolor="rgba(230, 126, 34, 0.12)", line_width=0, layer="below")
+
+    for result, symbol, name in [("Win", "circle", "Wins"), ("Loss", "x", "Losses")]:
+        subset = chart_df[chart_df["result"] == result]
+        if subset.empty:
+            continue
+        fig.add_trace(
+            go.Scatter(
+                x=subset["opponent_relative_elo"],
+                y=subset["score_performance_pp"],
+                mode="markers",
+                name=name,
+                marker=dict(
+                    symbol=symbol,
+                    size=subset["elo_impact_size"],
+                    color=subset["score_performance_pp"],
+                    colorscale=[
+                        [0.00, "#b2182b"],
+                        [0.35, "#ef8a62"],
+                        [0.50, "#f7f7f7"],
+                        [0.65, "#67a9cf"],
+                        [1.00, "#2166ac"],
+                    ],
+                    cmin=-max_color,
+                    cmax=max_color,
+                    colorbar=dict(title="Performance<br>vs expected"),
+                    line=dict(width=1.2, color="rgba(0,0,0,0.65)"),
+                    opacity=0.9,
+                ),
+                customdata=subset[[
+                    "match_date_label", "partner_names", "opponent_names", "score_label", "result",
+                    "expected_win_rate", "actual_score_share", "score_performance_pp", "elo_delta", "performance_band",
+                ]],
+                hovertemplate=(
+                    "<b>%{customdata[0]}</b><br>"
+                    "Partner(s): %{customdata[1]}<br>"
+                    "Opponent(s): %{customdata[2]}<br>"
+                    "Score: %{customdata[3]}<br>"
+                    "Result: %{customdata[4]}<br>"
+                    "Match difficulty: %{x:+.0f} Elo<br>"
+                    "Expected score share: %{customdata[5]:.1f}%<br>"
+                    "Actual score share: %{customdata[6]:.1f}%<br>"
+                    "Performance: %{customdata[7]:+.1f} pp (%{customdata[9]})<br>"
+                    "Elo change: %{customdata[8]:+.0f}<extra></extra>"
+                ),
+            )
+        )
+
+    fig.add_hline(y=0, line_width=2, line_color="rgba(0,0,0,0.65)", annotation_text="as expected", annotation_position="bottom right")
+    fig.add_vline(x=0, line_width=2, line_color="rgba(0,0,0,0.55)", annotation_text="even matchup", annotation_position="top")
+
+    label_box = dict(bgcolor="rgba(255,255,255,0.86)", bordercolor="rgba(0,0,0,0.20)", borderwidth=1)
+    fig.add_annotation(x=-max_x * 0.55, y=max_y * 0.72, showarrow=False, text="<b>Handled business</b><br>Favoured and scored well", **label_box)
+    fig.add_annotation(x=max_x * 0.55, y=max_y * 0.72, showarrow=False, text="<b>Punching up</b><br>Hard match, strong performance", **label_box)
+    fig.add_annotation(x=-max_x * 0.55, y=-max_y * 0.72, showarrow=False, text="<b>Slip-up zone</b><br>Favoured but underperformed", **label_box)
+    fig.add_annotation(x=max_x * 0.55, y=-max_y * 0.72, showarrow=False, text="<b>Outmatched</b><br>Hard match and struggled", **label_box)
+
+    fig.update_layout(
+        title=f"{selected_name}: match performance vs Elo expectation",
+        xaxis_title="Match difficulty: opponent team Elo minus your team Elo before the match",
+        yaxis_title="Score performance vs expected (percentage points)",
+        height=620,
+        margin=dict(l=20, r=20, t=75, b=75),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+    )
+    fig.update_xaxes(range=[-max_x, max_x], zeroline=False)
+    fig.update_yaxes(range=[-max_y, max_y], zeroline=False)
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("##### How to interpret this")
+    c1, c2, c3 = st.columns(3)
+    c1.info("**High dots** = you scored better than Elo expected. **Low dots** = underperformed.")
+    c2.info("**Right side** = harder matches. **Left side** = matches you were expected to do well in.")
+    c3.info("**Blue/green-ish dots** = better than expected. **Red/orange dots** = worse than expected.")
+
+    st.markdown("##### Matches worth reviewing")
+    review_rows = []
+    if not chart_df.empty:
+        best = chart_df.sort_values("score_performance_pp", ascending=False).head(3)
+        worst = chart_df.sort_values("score_performance_pp", ascending=True).head(3)
+        elo_loss = chart_df.sort_values("elo_delta", ascending=True).head(3)
+        for reason, subset in [
+            ("Best overperformance", best),
+            ("Biggest underperformance", worst),
+            ("Biggest Elo loss", elo_loss),
+        ]:
+            for _, r in subset.iterrows():
+                review_rows.append({
+                    "reason": reason,
+                    "date": r.get("match_date_label", ""),
+                    "partner": r.get("partner_names", ""),
+                    "opponents": r.get("opponent_names", ""),
+                    "score": r.get("score_label", ""),
+                    "result": r.get("result", ""),
+                    "performance_pp": round(float(r.get("score_performance_pp", 0)), 1),
+                    "elo_delta": round(float(r.get("elo_delta", 0)), 0),
+                    "video_url": r.get("video_url", ""),
+                    "match_id": r.get("match_id", ""),
+                })
+    review_df = pd.DataFrame(review_rows).drop_duplicates(subset=["reason", "match_id"]) if review_rows else pd.DataFrame()
+    if review_df.empty:
+        st.info("No review-priority matches yet.")
+    else:
+        st.dataframe(
+            review_df[["reason", "date", "partner", "opponents", "score", "result", "performance_pp", "elo_delta", "video_url", "match_id"]],
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "performance_pp": st.column_config.NumberColumn("Perf vs expected pp", format="%+.1f"),
+                "elo_delta": st.column_config.NumberColumn("Elo", format="%+.0f"),
+                "video_url": st.column_config.LinkColumn("Video", display_text="Open video"),
+            },
+        )
+
+
+def render_player_form_and_score_charts(
+    selected_pid: str,
+    selected_name: str,
+    matches_df: pd.DataFrame,
+    participants_df: pd.DataFrame,
+    elo_history_df: pd.DataFrame,
+    players_lookup: dict[str, str],
+) -> None:
+    st.markdown("#### Score performance and clutch")
+    timeline = build_player_match_timeline_df(selected_pid, matches_df, participants_df, elo_history_df, players_lookup)
+    if timeline.empty:
+        st.info("No completed match timeline yet for this player.")
+        return
+
+    # Expected vs actual score share
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=timeline["expected_win_rate"],
+        y=timeline["actual_score_share"],
+        mode="markers",
+        marker=dict(
+            size=10,
+            color=timeline["score_performance_pp"],
+            colorscale="RdYlGn",
+            cmin=-max(10, float(timeline["score_performance_pp"].abs().max() or 10)),
+            cmax=max(10, float(timeline["score_performance_pp"].abs().max() or 10)),
+            colorbar=dict(title="Score<br>perf pp"),
+            line=dict(width=1, color="rgba(0,0,0,0.45)"),
+        ),
+        customdata=timeline[["match_date_label", "partner_names", "opponent_names", "score_label", "result", "score_performance_pp", "elo_delta"]],
+        hovertemplate=(
+            "<b>%{customdata[0]}</b><br>"
+            "Partner(s): %{customdata[1]}<br>"
+            "Opponent(s): %{customdata[2]}<br>"
+            "Score: %{customdata[3]}<br>"
+            "Result: %{customdata[4]}<br>"
+            "Expected score share: %{x:.1f}%<br>"
+            "Actual score share: %{y:.1f}%<br>"
+            "Performance: %{customdata[5]:+.1f} pp<br>"
+            "Elo change: %{customdata[6]:+.0f}<extra></extra>"
+        ),
+        name="Matches",
+    ))
+    fig.add_trace(go.Scatter(x=[0, 100], y=[0, 100], mode="lines", line=dict(color="rgba(0,0,0,0.45)", dash="dash"), name="As expected"))
+    fig.update_layout(
+        title=f"{selected_name}: actual score share vs Elo expectation",
+        xaxis_title="Expected score share from Elo (%)",
+        yaxis_title="Actual score share (%)",
+        height=430,
+        margin=dict(l=20, r=20, t=70, b=50),
+    )
+    fig.update_xaxes(range=[0, 100])
+    fig.update_yaxes(range=[0, 100])
+    st.plotly_chart(fig, use_container_width=True)
+    st.caption("Above the dashed line = scored better than Elo expected. Below the line = scored worse than expected.")
+
+    clutch = build_player_clutch_summary_df(timeline)
+    if not clutch.empty:
+        st.markdown("#### Clutch: close-game win rate")
+        clutch_fig = px.bar(
+            clutch,
+            x="category",
+            y="win_rate",
+            text="win_rate",
+            title="Close games vs other games",
+            labels={"category": "Game type", "win_rate": "Win rate %"},
+        )
+        clutch_fig.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
+        clutch_fig.update_layout(height=360, margin=dict(l=15, r=15, t=60, b=45), yaxis_range=[0, 100])
+        st.plotly_chart(clutch_fig, use_container_width=True)
+        st.dataframe(
+            clutch[["category", "matches", "wins", "win_rate", "net_elo", "avg_score_performance"]],
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "win_rate": st.column_config.NumberColumn("Win rate %", format="%.1f"),
+                "net_elo": st.column_config.NumberColumn("Net Elo", format="%+.0f"),
+                "avg_score_performance": st.column_config.NumberColumn("Avg score perf pp", format="%+.1f"),
+            },
+        )
+
+
+def render_player_partner_chemistry_chart(
+    selected_pid: str,
+    selected_name: str,
+    matches_df: pd.DataFrame,
+    participants_df: pd.DataFrame,
+    elo_history_df: pd.DataFrame,
+    players_lookup: dict[str, str],
+) -> None:
+    st.markdown("#### Partner chemistry")
+    partner_df = build_partner_matrix_df(matches_df, participants_df, elo_history_df, players_lookup)
+    if partner_df.empty:
+        st.info("No doubles partner chemistry data yet.")
+        return
+    player_partners = partner_df[partner_df["player_id"].astype(str) == str(selected_pid)].copy()
+    if player_partners.empty:
+        st.info("No completed doubles matches with partners yet for this player.")
+        return
+    player_partners = player_partners.sort_values("avg_net_elo", ascending=True)
+    fig = px.bar(
+        player_partners,
+        x="avg_net_elo",
+        y="partner",
+        orientation="h",
+        title=f"{selected_name}: average Elo impact by partner",
+        labels={"avg_net_elo": "Avg Elo per match", "partner": "Partner"},
+        hover_data={"matches": True, "win_rate": ':.1f', "net_elo": ':+.0f', "avg_net_elo": ':+.1f'},
+    )
+    fig.add_vline(x=0, line_dash="dash", line_color="rgba(0,0,0,0.45)")
+    fig.update_layout(height=max(360, 36 * len(player_partners)), margin=dict(l=15, r=15, t=65, b=45))
+    st.plotly_chart(fig, use_container_width=True)
+    st.caption("Bars to the right mean this partner has historically gained you Elo on average. Bars to the left mean you have lost Elo with them on average.")
+
+
+def render_player_replacement_benchmark(
+    selected_pid: str,
+    selected_name: str,
+    matches_df: pd.DataFrame,
+    participants_df: pd.DataFrame,
+    elo_history_df: pd.DataFrame,
+    players_lookup: dict[str, str],
+) -> None:
+    st.markdown("#### Same setup benchmark")
+    st.caption(
+        "This asks: with the same partner against the same opponent pair, did you do better or worse than the other players who took your place?"
+    )
+
+    setup_options = build_player_context_setup_options(selected_pid, matches_df, participants_df, players_lookup)
+    if setup_options.empty:
+        st.info("No exact doubles setup benchmark yet. You need completed doubles matches where the same partner/opponent setup appears.")
+        return
+
+    setup_options = setup_options.sort_values(["selected_match_count", "setup_label"], ascending=[False, True]).copy()
+    setup_options["display_label"] = setup_options.apply(
+        lambda r: f"{r['setup_label']} — you played this {int(r['selected_match_count'])} time(s)",
+        axis=1,
+    )
+    selected_setup_label = st.selectbox(
+        "Setup to compare",
+        setup_options["display_label"].tolist(),
+        key=f"replacement_setup_{selected_pid}",
+    )
+    setup_row = setup_options[setup_options["display_label"] == selected_setup_label].iloc[0]
+    partner_id = str(setup_row["partner_id"])
+    opponent_ids = str(setup_row["opponent_key"]).split("|")
+
+    benchmark = build_replacement_benchmark_df(selected_pid, partner_id, opponent_ids, matches_df, participants_df, elo_history_df, players_lookup)
+    if benchmark.empty:
+        st.info("No benchmark matches found for this exact setup yet.")
+        return
+
+    summary = summarise_replacement_benchmark(benchmark)
+    if summary.empty:
+        st.info("No benchmark summary available yet.")
+        return
+
+    selected_summary = summary[summary["candidate_id"].astype(str) == str(selected_pid)]
+    others = summary[summary["candidate_id"].astype(str) != str(selected_pid)]
+    selected_avg = float(selected_summary["avg_performance_pp"].iloc[0]) if not selected_summary.empty else 0.0
+    others_avg = float(others["avg_performance_pp"].mean()) if not others.empty else 0.0
+    replacement_value = selected_avg - others_avg
+    selected_matches = int(selected_summary["matches"].iloc[0]) if not selected_summary.empty else 0
+
+    verdict = "Better than replacements" if replacement_value > 1 else ("Worse than replacements" if replacement_value < -1 else "About the same")
+    verdict_delta = f"{replacement_value:+.1f} pp"
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("You in this setup", f"{selected_avg:+.1f} pp", f"{selected_matches} match(es)")
+    m2.metric("Others in your place", f"{others_avg:+.1f} pp", f"{len(others)} replacement player(s)")
+    m3.metric("Verdict", verdict, verdict_delta)
+
+    st.caption(
+        "Positive numbers mean the player scored better than Elo expected. Negative numbers mean they scored worse than Elo expected. "
+        "The verdict compares you against the average of everyone else in the same role."
+    )
+
+    summary = summary.sort_values("avg_performance_pp", ascending=True).copy()
+    summary["label"] = summary.apply(
+        lambda r: f"⭐ {r['candidate']}" if str(r["candidate_id"]) == str(selected_pid) else str(r["candidate"]),
+        axis=1,
+    )
+
+    fig = go.Figure()
+    colors = summary["candidate_id"].astype(str).apply(lambda pid: "#2563eb" if pid == str(selected_pid) else "#9ca3af")
+    fig.add_trace(go.Bar(
+        x=summary["avg_performance_pp"],
+        y=summary["label"],
+        orientation="h",
+        marker_color=colors,
+        text=summary["avg_performance_pp"].apply(lambda x: f"{x:+.1f} pp"),
+        textposition="outside",
+        customdata=summary[["matches", "wins", "losses", "win_rate", "avg_elo", "total_elo", "replacement_value_pp"]],
+        hovertemplate=(
+            "<b>%{y}</b><br>"
+            "Avg performance: %{x:+.1f} pp<br>"
+            "Matches: %{customdata[0]}<br>"
+            "Wins/Losses: %{customdata[1]}/%{customdata[2]}<br>"
+            "Win rate: %{customdata[3]:.1f}%<br>"
+            "Avg Elo change: %{customdata[4]:+.1f}<br>"
+            "Total Elo: %{customdata[5]:+.0f}<extra></extra>"
+        ),
+    ))
+    fig.add_vline(x=0, line_dash="dash", line_color="rgba(0,0,0,0.45)")
+    fig.update_layout(
+        title=f"Who performs best with {setup_row['partner']} vs {setup_row['opponents']}?",
+        xaxis_title="Average score performance vs expected",
+        yaxis_title="Player in your place",
+        height=max(360, 52 * len(summary)),
+        margin=dict(l=20, r=45, t=70, b=45),
+        showlegend=False,
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    compact = summary.sort_values("avg_performance_pp", ascending=False).copy()
+    compact["player"] = compact["candidate"]
+    compact["avg_perf"] = compact["avg_performance_pp"]
+    compact["avg_elo_change"] = compact["avg_elo"]
+    st.dataframe(
+        compact[["player", "matches", "win_rate", "avg_perf", "avg_elo_change"]],
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "player": "Player",
+            "matches": "Matches",
+            "win_rate": st.column_config.NumberColumn("Win rate %", format="%.1f"),
+            "avg_perf": st.column_config.NumberColumn("Avg performance", format="%+.1f pp"),
+            "avg_elo_change": st.column_config.NumberColumn("Avg Elo", format="%+.1f"),
+        },
+    )
+
+    with st.expander("Show match-level details", expanded=False):
+        match_table = benchmark.sort_values(["candidate", "match_date", "match_id"]).copy()
+        st.dataframe(
+            match_table[["candidate", "match_date_label", "score_label", "result", "score_performance_pp", "elo_delta", "video_url"]],
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "candidate": "Player",
+                "match_date_label": "Date",
+                "score_label": "Score",
+                "score_performance_pp": st.column_config.NumberColumn("Performance", format="%+.1f pp"),
+                "elo_delta": st.column_config.NumberColumn("Elo", format="%+.0f"),
+                "video_url": st.column_config.LinkColumn("Video", display_text="Open video"),
+            },
+        )
+
+
+def render_player_head_to_head_matrix(
+    selected_pid: str,
+    selected_name: str,
+    matches_df: pd.DataFrame,
+    participants_df: pd.DataFrame,
+    elo_history_df: pd.DataFrame,
+    players_lookup: dict[str, str],
+) -> None:
+    st.markdown("#### Head-to-head opponent matrix")
+    h2h = build_player_head_to_head_df(selected_pid, matches_df, participants_df, elo_history_df, players_lookup)
+    if h2h.empty:
+        st.info("No head-to-head opponent data yet.")
+        return
+
+    h2h = h2h.sort_values(["win_rate", "matches", "net_elo"], ascending=[False, False, False]).copy()
+    z = [h2h["win_rate"].tolist()]
+    text = [h2h["hover"].tolist()]
+
+    fig = go.Figure(data=go.Heatmap(
+        z=z,
+        x=h2h["opponent"].tolist(),
+        y=[selected_name],
+        text=text,
+        hovertemplate="%{text}<extra></extra>",
+        colorscale="RdYlGn",
+        zmin=0,
+        zmax=100,
+        colorbar=dict(title="Win rate %"),
+    ))
+    fig.update_layout(
+        title=f"{selected_name}: head-to-head win rate against opponents",
+        xaxis_title="Opponent",
+        yaxis_title="Player",
+        height=280,
+        margin=dict(l=70, r=20, t=70, b=100),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.dataframe(
+        h2h[["opponent", "matches", "wins", "losses", "win_rate", "elo_gained", "elo_lost_abs", "net_elo"]],
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "win_rate": st.column_config.NumberColumn("Win rate %", format="%.1f"),
+            "elo_gained": st.column_config.NumberColumn("Elo gained", format="+%.0f"),
+            "elo_lost_abs": st.column_config.NumberColumn("Elo lost", format="%.0f"),
+            "net_elo": st.column_config.NumberColumn("Net Elo", format="%+.0f"),
+        },
+    )
+
 def render_player_explorer(players_df: pd.DataFrame, stats_df: pd.DataFrame, review_df: pd.DataFrame, matches_df: pd.DataFrame, players_lookup: dict[str, str]) -> None:
     st.subheader("Player Explorer")
     if players_df.empty:
@@ -1145,6 +1637,11 @@ def render_player_explorer(players_df: pd.DataFrame, stats_df: pd.DataFrame, rev
         metric_cols[5].metric("Highlights", int(stat_row["highlights"]))
 
     render_player_relationship_highlights(selected_pid, matches_df, match_participants_df, elo_history_df, players_lookup)
+    render_player_form_and_score_charts(selected_pid, selected_name, matches_df, match_participants_df, elo_history_df, players_lookup)
+    render_player_partner_chemistry_chart(selected_pid, selected_name, matches_df, match_participants_df, elo_history_df, players_lookup)
+    render_player_loss_risk_heatmap(selected_pid, selected_name, matches_df, match_participants_df, elo_history_df, players_lookup)
+    render_player_replacement_benchmark(selected_pid, selected_name, matches_df, match_participants_df, elo_history_df, players_lookup)
+    render_player_head_to_head_matrix(selected_pid, selected_name, matches_df, match_participants_df, elo_history_df, players_lookup)
 
     player_events = review_df[review_df["player_id"].astype(str) == selected_pid].copy() if not review_df.empty else pd.DataFrame()
     if not match_participants_df.empty:
@@ -1677,33 +2174,22 @@ with tab9:
 with tab10:
     st.subheader("Match History")
     history = matches_df.copy()
-
     if history.empty:
         st.info("No matches yet.")
     else:
         history = add_match_display_columns(history, players_lookup)
-
         history_display = history[[
-            "scheduled_date", "scheduled_time", "match_type", "points_to_win",
-            "team_a_names", "team_b_names",
-            "team_a_score", "team_b_score",
-            "winner_label", "status", "video_url", "notes"
+            "scheduled_date", "scheduled_time", "match_type", "points_to_win", "team_a_names", "team_b_names",
+            "team_a_score", "team_b_score", "winner_label", "status", "video_url", "notes"
         ]]
-
         st.dataframe(
             history_display,
             use_container_width=True,
-            column_config={
-                "video_url": st.column_config.LinkColumn(
-                    "Video URL",
-                    display_text="Open video"
-                )
-            },
+            column_config={"video_url": st.column_config.LinkColumn("Video URL", display_text="Open video")},
             hide_index=True,
         )
 
         csv = history_display.to_csv(index=False).encode("utf-8")
-
         st.download_button(
             label="Download match history CSV",
             data=csv,
@@ -1713,19 +2199,11 @@ with tab10:
         )
 
         completed = history[history["status"] == "Completed"].copy()
-
         if not completed.empty:
-            completed["played_on"] = completed["scheduled_date"].replace(
-                "", pd.NA
-            ).fillna(completed["completed_at"].astype(str).str[:10])
-
-            match_chart = px.histogram(
-                completed,
-                x="played_on",
-                title="Matches completed over time"
-            )
-
+            completed["played_on"] = completed["scheduled_date"].replace("", pd.NA).fillna(completed["completed_at"].astype(str).str[:10])
+            match_chart = px.histogram(completed, x="played_on", title="Matches completed over time")
             st.plotly_chart(match_chart, use_container_width=True)
+
 
 with tab11:
     st.subheader("Admin tools")
