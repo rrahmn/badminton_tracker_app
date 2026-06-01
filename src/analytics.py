@@ -44,11 +44,25 @@ def build_elo_timeline_df(matches_view: pd.DataFrame, elo_history_df: pd.DataFra
         if col not in history.columns:
             history[col] = ""
 
-    history["match_date_label"] = history["scheduled_date"].replace("", pd.NA).fillna(history["recorded_at"].astype(str).str[:10]).fillna("")
+    history["match_date_dt"] = pd.to_datetime(history["scheduled_date"], errors="coerce")
+    history["match_date_dt"] = history["match_date_dt"].fillna(history["recorded_at_dt"].dt.normalize())
+    history["match_date_label"] = history["match_date_dt"].dt.strftime("%Y-%m-%d").fillna(history["recorded_at"].astype(str).str[:10]).fillna("")
     history["score_label"] = history.apply(
         lambda r: f"{_safe_int(r.get('team_a_score'))} - {_safe_int(r.get('team_b_score'))}",
         axis=1,
     )
+
+    # Chart-specific x position: use the match date, but spread multiple matches
+    # on the same day horizontally so imported batches are readable.
+    match_order = history[["match_id", "match_date_dt", "recorded_at_dt", "recorded_at"]].drop_duplicates("match_id").copy()
+    match_order = match_order.sort_values(["match_date_dt", "recorded_at_dt", "recorded_at", "match_id"])
+    match_order["date_group"] = match_order["match_date_dt"].dt.date.astype(str)
+    match_order["day_order"] = match_order.groupby("date_group").cumcount()
+    match_order["day_count"] = match_order.groupby("date_group")["match_id"].transform("count")
+    # Spread between 02:00 and 22:00 within the same displayed date.
+    match_order["spread_minutes"] = 120 + ((match_order["day_order"] + 1) * (20 * 60 / (match_order["day_count"] + 1)))
+    match_order["chart_x_dt"] = match_order["match_date_dt"].dt.normalize() + pd.to_timedelta(match_order["spread_minutes"], unit="m")
+    history = history.merge(match_order[["match_id", "chart_x_dt"]], on="match_id", how="left")
     history["delta_label"] = history["delta"].apply(lambda x: f"{float(x):+.0f}")
     history["hover_details"] = history.apply(
         lambda r: (
@@ -61,7 +75,7 @@ def build_elo_timeline_df(matches_view: pd.DataFrame, elo_history_df: pd.DataFra
         ),
         axis=1,
     )
-    return history.sort_values(["recorded_at_dt", "recorded_at", "match_id", "player"])
+    return history.sort_values(["chart_x_dt", "recorded_at_dt", "recorded_at", "match_id", "player"])
 
 
 def build_partner_matrix_df(matches_df: pd.DataFrame, participants_df: pd.DataFrame, elo_history_df: pd.DataFrame, players_lookup: dict[str, str]) -> pd.DataFrame:

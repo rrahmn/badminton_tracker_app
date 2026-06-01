@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from difflib import get_close_matches
 from datetime import date, datetime
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
@@ -556,6 +557,251 @@ def complete_match(match_id: str) -> None:
     updated_row = st.session_state.matches_df[st.session_state.matches_df["match_id"].astype(str) == str(match_id)].iloc[0]
     apply_elo_for_match(match_id, winner, updated_row)
 
+
+
+def _normalise_name_text(value: str) -> str:
+    text = str(value or "").strip().lower()
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _build_player_alias_map(players_df: pd.DataFrame) -> dict[str, str]:
+    aliases: dict[str, str] = {}
+    manual_aliases = {
+        "viet": "Viet To",
+        "viet to": "Viet To",
+        "umar": "Umar Hussain",
+        "umar hussain": "Umar Hussain",
+        "rianur": "Rianur Rahman",
+        "rian": "Rianur Rahman",
+        "rianur rahman": "Rianur Rahman",
+        "emad": "Emad Uddin",
+        "emad uddin": "Emad Uddin",
+        "ibrahim": "Ibrahim Yusuf",
+        "ibrahim yusuf": "Ibrahim Yusuf",
+        "salman": "Salman Ahmad",
+        "salman ahmad": "Salman Ahmad",
+        "tahmid": "Tahmid Khan",
+        "tahmid khan": "Tahmid Khan",
+        "morgan": "Morgan Chai",
+        "morgan chai": "Morgan Chai",
+    }
+    name_to_id = {str(row["name"]): str(row["player_id"]) for _, row in players_df.iterrows()}
+    for alias, canonical in manual_aliases.items():
+        if canonical in name_to_id:
+            aliases[_normalise_name_text(alias)] = name_to_id[canonical]
+    for _, row in players_df.iterrows():
+        pid = str(row["player_id"])
+        name = str(row["name"])
+        norm = _normalise_name_text(name)
+        if norm:
+            aliases[norm] = pid
+        parts = norm.split()
+        if parts:
+            aliases.setdefault(parts[0], pid)
+    return aliases
+
+
+def _split_team_entry(team_text: str) -> list[str]:
+    text = str(team_text or "").strip()
+    text = re.sub(r"\b(an)\b", "and", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s*&\s*|\s*/\s*|\s*\+\s*|\s*,\s*", " and ", text)
+    parts = [p.strip() for p in re.split(r"\band\b", text, flags=re.IGNORECASE) if p.strip()]
+    return parts or ([text] if text else [])
+
+
+def _resolve_player_name(raw_name: str, alias_map: dict[str, str], players_lookup: dict[str, str]) -> tuple[str | None, str | None]:
+    norm = _normalise_name_text(raw_name)
+    if not norm:
+        return None, "Blank player name"
+    if norm in alias_map:
+        return alias_map[norm], None
+    close = get_close_matches(norm, list(alias_map.keys()), n=1, cutoff=0.82)
+    if close:
+        return alias_map[close[0]], None
+    return None, f"Could not match player '{raw_name}'"
+
+
+def _parse_score(score_raw: str) -> tuple[int | None, int | None, str | None]:
+    text = str(score_raw or "").strip()
+    match = re.search(r"(\d+)\s*[-–—:]\s*(\d+)", text)
+    if not match:
+        return None, None, f"Could not parse score '{score_raw}'"
+    return int(match.group(1)), int(match.group(2)), None
+
+
+def _parse_import_date(date_raw: str, default_year: int) -> tuple[str | None, str | None]:
+    text = str(date_raw or "").strip()
+    if not text:
+        return None, "Missing date"
+    parsed = pd.to_datetime(f"{text}-{default_year}", format="%d-%b-%Y", errors="coerce")
+    if pd.isna(parsed):
+        parsed = pd.to_datetime(f"{text} {default_year}", errors="coerce")
+    if pd.isna(parsed):
+        parsed = pd.to_datetime(text, errors="coerce")
+    if pd.isna(parsed):
+        return None, f"Could not parse date '{date_raw}'"
+    return parsed.date().isoformat(), None
+
+
+def _make_import_duplicate_key(row: dict) -> tuple:
+    team_a = tuple(sorted(row.get("team_a_ids", [])))
+    team_b = tuple(sorted(row.get("team_b_ids", [])))
+    return (
+        row.get("scheduled_date", ""),
+        team_a,
+        team_b,
+        int(row.get("team_a_score", 0)),
+        int(row.get("team_b_score", 0)),
+        str(row.get("video_url", "") or "").strip(),
+    )
+
+
+def _existing_completed_match_keys(matches_df: pd.DataFrame) -> set[tuple]:
+    keys: set[tuple] = set()
+    if matches_df.empty:
+        return keys
+    for _, match in matches_df.iterrows():
+        if str(match.get("status", "")).lower() != "completed":
+            continue
+        row = {
+            "scheduled_date": str(match.get("scheduled_date", "") or ""),
+            "team_a_ids": get_match_team_ids(match, "A"),
+            "team_b_ids": get_match_team_ids(match, "B"),
+            "team_a_score": int(match.get("team_a_score", 0) or 0),
+            "team_b_score": int(match.get("team_b_score", 0) or 0),
+            "video_url": str(match.get("video_url", "") or "").strip(),
+        }
+        keys.add(_make_import_duplicate_key(row))
+    return keys
+
+
+def parse_completed_matches_import(uploaded_df: pd.DataFrame, players_df: pd.DataFrame, matches_df: pd.DataFrame, players_lookup: dict[str, str], default_year: int) -> tuple[pd.DataFrame, pd.DataFrame]:
+    required = ["Date", "Team A", "Team B", "Score", "Link", "Match Type"]
+    missing = [c for c in required if c not in uploaded_df.columns]
+    if missing:
+        return pd.DataFrame(), pd.DataFrame([{"row_number": "—", "error": f"Missing required columns: {', '.join(missing)}"}])
+
+    alias_map = _build_player_alias_map(players_df)
+    existing_keys = _existing_completed_match_keys(matches_df)
+    seen_import_keys: set[tuple] = set()
+    parsed_rows: list[dict] = []
+    errors: list[dict] = []
+
+    for row_index, row in uploaded_df.reset_index(drop=True).iterrows():
+        row_number = int(row_index) + 2  # spreadsheet row number including header
+        row_errors: list[str] = []
+        match_type = str(row.get("Match Type", "") or "").strip().title()
+        if match_type not in {"Singles", "Doubles"}:
+            row_errors.append(f"Invalid Match Type '{row.get('Match Type')}'")
+
+        scheduled_date, date_error = _parse_import_date(row.get("Date", ""), default_year)
+        if date_error:
+            row_errors.append(date_error)
+
+        team_a_parts = _split_team_entry(row.get("Team A", ""))
+        team_b_parts = _split_team_entry(row.get("Team B", ""))
+        expected_players = 1 if match_type == "Singles" else 2
+        if match_type in {"Singles", "Doubles"}:
+            if len(team_a_parts) != expected_players:
+                row_errors.append(f"Team A expected {expected_players} player(s), found {len(team_a_parts)}: {team_a_parts}")
+            if len(team_b_parts) != expected_players:
+                row_errors.append(f"Team B expected {expected_players} player(s), found {len(team_b_parts)}: {team_b_parts}")
+
+        team_a_ids: list[str] = []
+        team_b_ids: list[str] = []
+        for raw_player in team_a_parts:
+            pid, err = _resolve_player_name(raw_player, alias_map, players_lookup)
+            if err:
+                row_errors.append(err)
+            elif pid:
+                team_a_ids.append(pid)
+        for raw_player in team_b_parts:
+            pid, err = _resolve_player_name(raw_player, alias_map, players_lookup)
+            if err:
+                row_errors.append(err)
+            elif pid:
+                team_b_ids.append(pid)
+
+        if set(team_a_ids) & set(team_b_ids):
+            row_errors.append("Same player appears on both teams")
+
+        team_a_score, team_b_score, score_error = _parse_score(row.get("Score", ""))
+        if score_error:
+            row_errors.append(score_error)
+        elif team_a_score == team_b_score:
+            row_errors.append("Completed match score cannot be tied")
+
+        video_url = str(row.get("Link", "") or "").strip()
+        if not video_url:
+            row_errors.append("Missing YouTube/video link")
+
+        parsed = {
+            "spreadsheet_row": row_number,
+            "scheduled_date": scheduled_date or "",
+            "scheduled_time": f"00:{(row_index + 1) // 60:02d}:{(row_index + 1) % 60:02d}",
+            "match_type": match_type,
+            "team_a_raw": str(row.get("Team A", "") or ""),
+            "team_b_raw": str(row.get("Team B", "") or ""),
+            "team_a_ids": team_a_ids,
+            "team_b_ids": team_b_ids,
+            "team_a_names": " / ".join(players_lookup.get(pid, pid) for pid in team_a_ids),
+            "team_b_names": " / ".join(players_lookup.get(pid, pid) for pid in team_b_ids),
+            "team_a_score": team_a_score if team_a_score is not None else 0,
+            "team_b_score": team_b_score if team_b_score is not None else 0,
+            "winner": "A" if (team_a_score or 0) > (team_b_score or 0) else "B",
+            "video_url": video_url,
+            "source_score": str(row.get("Score", "") or ""),
+            "duplicate": False,
+        }
+        if not row_errors:
+            import_key = _make_import_duplicate_key(parsed)
+            parsed["duplicate"] = import_key in existing_keys or import_key in seen_import_keys
+            seen_import_keys.add(import_key)
+        if row_errors:
+            errors.append({"row_number": row_number, "error": "; ".join(row_errors)})
+        parsed_rows.append(parsed)
+
+    return pd.DataFrame(parsed_rows), pd.DataFrame(errors)
+
+
+def import_completed_matches(parsed_df: pd.DataFrame) -> tuple[int, int]:
+    require_editor()
+    imported = 0
+    skipped = 0
+    for _, row in parsed_df.iterrows():
+        if bool(row.get("duplicate", False)):
+            skipped += 1
+            continue
+        match_id = str(uuid4())
+        team_a_ids = list(row.get("team_a_ids", []))
+        team_b_ids = list(row.get("team_b_ids", []))
+        match_row = {
+            "match_id": match_id,
+            "created_at": now_iso(),
+            "completed_at": now_iso(),
+            "match_type": str(row.get("match_type", "")),
+            "points_to_win": max(int(row.get("team_a_score", 0)), int(row.get("team_b_score", 0))),
+            "team_a_players": "|".join(team_a_ids),
+            "team_b_players": "|".join(team_b_ids),
+            "team_a_score": int(row.get("team_a_score", 0)),
+            "team_b_score": int(row.get("team_b_score", 0)),
+            "winner": str(row.get("winner", "")),
+            "status": "Completed",
+            "video_url": str(row.get("video_url", "") or ""),
+            "scheduled_date": str(row.get("scheduled_date", "") or ""),
+            "scheduled_time": str(row.get("scheduled_time", "") or ""),
+            "notes": f"Imported via CSV | Source row: {int(row.get('spreadsheet_row', 0))}",
+        }
+        storage.append_row("matches", match_row)
+        for participant in create_match_participants_rows(match_id, team_a_ids, team_b_ids).to_dict("records"):
+            storage.append_row("match_participants", participant)
+        imported += 1
+    refresh_state()
+    if imported:
+        recalculate_elo_history()
+    return imported, skipped
+
 def parse_date_str(raw: str) -> date:
     try:
         return date.fromisoformat(str(raw))
@@ -713,10 +959,10 @@ def render_elo_history_page(players_df: pd.DataFrame, matches_df: pd.DataFrame, 
         return
 
     fig = go.Figure()
-    x_title = "Match date / Elo update time"
+    x_title = "Match date (matches on same day spread horizontally)"
     for player_name, group in filtered.groupby("player", sort=True):
-        group = group.sort_values(["recorded_at_dt", "recorded_at", "match_id"])
-        x_values = group["recorded_at_dt"].fillna(pd.to_datetime(group["recorded_at"], errors="coerce"))
+        group = group.sort_values(["chart_x_dt", "recorded_at_dt", "recorded_at", "match_id"])
+        x_values = group["chart_x_dt"].fillna(group["match_date_dt"]).fillna(group["recorded_at_dt"])
         if x_values.isna().all():
             x_values = list(range(1, len(group) + 1))
             x_title = "Elo event order"
@@ -743,7 +989,7 @@ def render_elo_history_page(players_df: pd.DataFrame, matches_df: pd.DataFrame, 
     st.plotly_chart(fig, use_container_width=True)
     st.caption("Hover over a marker to see the match, score, winner and Elo change. Streamlit does not natively open pages from Plotly clicks, so use the selector below to inspect the exact match.")
 
-    event_options = filtered.sort_values(["recorded_at_dt", "recorded_at", "player"], ascending=[False, False, True]).copy()
+    event_options = filtered.sort_values(["chart_x_dt", "recorded_at_dt", "recorded_at", "player"], ascending=[False, False, False, True]).copy()
     event_options["elo_event_label"] = event_options.apply(
         lambda r: f"{r.get('player', '')}: {r.get('delta_label', '')} Elo | {r.get('match_date_label', '')} | {r.get('team_a_names', '')} vs {r.get('team_b_names', '')} | {r.get('score_label', '')}",
         axis=1,
@@ -1449,3 +1695,45 @@ with tab11:
             processed = recalculate_elo_history()
             st.success(f"Elo recalculated from {processed} completed match(es).")
             st.rerun()
+
+        st.divider()
+        st.markdown("### Import completed matches from CSV")
+        st.write("Upload a spreadsheet with columns: Date, Team A, Team B, Score, Link, Match Type. Matches are imported in spreadsheet order as completed matches, then Elo is rebuilt.")
+        import_year = st.number_input("Year for dates like 04-Apr", min_value=2020, max_value=2100, value=date.today().year, step=1)
+        uploaded_scores = st.file_uploader("Upload completed match CSV", type=["csv"], key="completed_match_csv_import")
+        if uploaded_scores is not None:
+            try:
+                uploaded_df = pd.read_csv(uploaded_scores)
+                parsed_df, import_errors = parse_completed_matches_import(uploaded_df, players_df, matches_df, players_lookup, int(import_year))
+                c1, c2, c3 = st.columns(3)
+                c1.metric("Rows found", len(uploaded_df))
+                c2.metric("Ready to import", int((~parsed_df.get("duplicate", pd.Series(dtype=bool))).sum()) if not parsed_df.empty else 0)
+                c3.metric("Duplicates skipped", int(parsed_df.get("duplicate", pd.Series(dtype=bool)).sum()) if not parsed_df.empty else 0)
+
+                if not import_errors.empty:
+                    st.error("Fix these rows before importing.")
+                    st.dataframe(import_errors, use_container_width=True, hide_index=True)
+                elif parsed_df.empty:
+                    st.warning("No valid rows found to import.")
+                else:
+                    preview = parsed_df.copy()
+                    preview["team_a_ids"] = preview["team_a_ids"].apply(lambda x: "|".join(x) if isinstance(x, list) else x)
+                    preview["team_b_ids"] = preview["team_b_ids"].apply(lambda x: "|".join(x) if isinstance(x, list) else x)
+                    st.markdown("#### Import preview")
+                    st.dataframe(
+                        preview[[
+                            "spreadsheet_row", "scheduled_date", "scheduled_time", "match_type", "team_a_names", "team_b_names",
+                            "team_a_score", "team_b_score", "winner", "duplicate", "video_url"
+                        ]],
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={"video_url": st.column_config.LinkColumn("Video", display_text="Open")},
+                    )
+                    confirm_import = st.checkbox("I have reviewed the preview and want to import these completed matches", key="confirm_completed_csv_import")
+                    importable_count = int((~parsed_df["duplicate"]).sum())
+                    if st.button("Import completed matches and rebuild Elo", disabled=(not confirm_import or importable_count == 0), type="primary", use_container_width=True):
+                        imported, skipped = import_completed_matches(parsed_df)
+                        st.success(f"Imported {imported} match(es), skipped {skipped} duplicate(s), and rebuilt Elo.")
+                        st.rerun()
+            except Exception as exc:
+                st.error(f"Could not parse/import this CSV: {exc}")
