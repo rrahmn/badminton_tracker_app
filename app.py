@@ -1677,26 +1677,55 @@ with tab9:
 with tab10:
     st.subheader("Match History")
     history = matches_df.copy()
+
     if history.empty:
         st.info("No matches yet.")
     else:
         history = add_match_display_columns(history, players_lookup)
+
+        history_display = history[[
+            "scheduled_date", "scheduled_time", "match_type", "points_to_win",
+            "team_a_names", "team_b_names",
+            "team_a_score", "team_b_score",
+            "winner_label", "status", "video_url", "notes"
+        ]]
+
         st.dataframe(
-            history[[
-                "scheduled_date", "scheduled_time", "match_type", "points_to_win", "team_a_names", "team_b_names",
-                "team_a_score", "team_b_score", "winner_label", "status", "video_url", "notes"
-            ]],
+            history_display,
             use_container_width=True,
-            column_config={"video_url": st.column_config.LinkColumn("Video URL", display_text="Open video")},
+            column_config={
+                "video_url": st.column_config.LinkColumn(
+                    "Video URL",
+                    display_text="Open video"
+                )
+            },
             hide_index=True,
         )
 
-        completed = history[history["status"] == "Completed"].copy()
-        if not completed.empty:
-            completed["played_on"] = completed["scheduled_date"].replace("", pd.NA).fillna(completed["completed_at"].astype(str).str[:10])
-            match_chart = px.histogram(completed, x="played_on", title="Matches completed over time")
-            st.plotly_chart(match_chart, use_container_width=True)
+        csv = history_display.to_csv(index=False).encode("utf-8")
 
+        st.download_button(
+            label="Download match history CSV",
+            data=csv,
+            file_name="match_history.csv",
+            mime="text/csv",
+            key="download_match_history_csv",
+        )
+
+        completed = history[history["status"] == "Completed"].copy()
+
+        if not completed.empty:
+            completed["played_on"] = completed["scheduled_date"].replace(
+                "", pd.NA
+            ).fillna(completed["completed_at"].astype(str).str[:10])
+
+            match_chart = px.histogram(
+                completed,
+                x="played_on",
+                title="Matches completed over time"
+            )
+
+            st.plotly_chart(match_chart, use_container_width=True)
 
 with tab11:
     st.subheader("Admin tools")
