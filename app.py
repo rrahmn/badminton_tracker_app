@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import re
+import random
+from itertools import combinations
 from difflib import get_close_matches
 from datetime import date, datetime
 from pathlib import Path
@@ -23,6 +25,13 @@ from src.storage import CSVStorage, SupabaseStorage, DATA_FILES
 APP_DIR = Path(__file__).resolve().parent
 DATA_DIR = APP_DIR / "data"
 st.set_page_config(page_title="Badminton Tracker", layout="wide")
+
+# Authentication is intentionally the first thing shown after page config.
+# This prevents the full app UI from rendering behind/before the login form and
+# avoids the login box ending up far down the page during Streamlit reruns.
+require_login()
+current_role = get_role()
+
 st.title("🏸 Badminton Tracker")
 st.caption("Track singles and doubles matches, clips, player events and Elo.")
 
@@ -39,9 +48,6 @@ div[data-baseweb="tab"][aria-selected="true"] {background: rgba(34,197,94,.12); 
 [data-testid="stVerticalBlock"] div[data-testid="stForm"] {border: 1px solid rgba(120,120,120,.12); border-radius: 18px; padding: 1rem; background: rgba(255,255,255,.02);}
 </style>
 """, unsafe_allow_html=True)
-
-require_login()
-current_role = get_role()
 
 def build_storage():
     try:
@@ -1260,6 +1266,7 @@ def render_player_elo_relationship_impact_page(players_df: pd.DataFrame, matches
         )
 
 
+
 def render_partner_matrix_page(players_df: pd.DataFrame, matches_df: pd.DataFrame, participants_df: pd.DataFrame, elo_history_df: pd.DataFrame, players_lookup: dict[str, str]) -> None:
     st.subheader("Partner evaluation matrix")
     st.caption("Rows show the player being evaluated. Columns show their doubles partner. The cell colour is the average net Elo change per match for the row player when paired with that partner.")
@@ -1304,10 +1311,61 @@ def render_partner_matrix_page(players_df: pd.DataFrame, matches_df: pd.DataFram
     fig.update_xaxes(side="top")
     st.plotly_chart(fig, use_container_width=True)
 
+    st.markdown("#### Partnership visual")
+    pair_rows = []
+    if not filtered.empty:
+        directional = filtered.copy()
+        directional["pair_key"] = directional.apply(lambda r: "||".join(sorted([str(r["player"]), str(r["partner"])])), axis=1)
+        for pair_key, group in directional.groupby("pair_key"):
+            pair_names = pair_key.split("||")
+            if len(pair_names) != 2 or pair_names[0] == pair_names[1]:
+                continue
+            pair_rows.append({
+                "partnership": f"{pair_names[0]} + {pair_names[1]}",
+                "matches": int(pd.to_numeric(group["matches"], errors="coerce").max()),
+                "wins": int(pd.to_numeric(group["wins"], errors="coerce").max()),
+                "losses": int(pd.to_numeric(group["losses"], errors="coerce").max()),
+                "win_rate": float(pd.to_numeric(group["win_rate"], errors="coerce").mean()),
+                "avg_net_elo": float(pd.to_numeric(group["avg_net_elo"], errors="coerce").mean()),
+                "avg_elo_gained": float(pd.to_numeric(group["avg_elo_gained"], errors="coerce").mean()),
+                "avg_elo_lost": float(pd.to_numeric(group["avg_elo_lost"], errors="coerce").mean()),
+                "elo_gained": float(pd.to_numeric(group["elo_gained"], errors="coerce").mean()),
+                "elo_lost_abs": float(pd.to_numeric(group["elo_lost_abs"], errors="coerce").mean()),
+                "net_elo": float(pd.to_numeric(group["net_elo"], errors="coerce").mean()),
+            })
+    pair_table = pd.DataFrame(pair_rows)
+    if pair_table.empty:
+        st.info("No partnership summary available for the selected players.")
+        return
+
+    pair_table = pair_table.sort_values("avg_net_elo", ascending=False)
+    visual = pair_table.copy()
+    visual["bar_colour"] = visual["avg_net_elo"].apply(lambda x: "#16a34a" if x >= 0 else "#dc2626")
+    fig2 = go.Figure()
+    fig2.add_trace(go.Bar(
+        x=visual["avg_net_elo"],
+        y=visual["partnership"],
+        orientation="h",
+        marker_color=visual["bar_colour"],
+        customdata=visual[["matches", "win_rate", "net_elo"]],
+        hovertemplate="<b>%{y}</b><br>Avg Elo / match: %{x:+.1f}<br>Matches: %{customdata[0]}<br>Win rate: %{customdata[1]:.1f}%<br>Total net Elo: %{customdata[2]:+.0f}<extra></extra>",
+        name="Average Elo / match",
+    ))
+    fig2.add_vline(x=0, line_width=1, line_dash="dash")
+    fig2.update_layout(
+        title="Best and worst partnerships by average Elo impact",
+        xaxis_title="Average net Elo per match",
+        yaxis_title="Partnership",
+        height=max(420, 34 * len(visual)),
+        margin=dict(l=120, r=20, t=60, b=40),
+        showlegend=False,
+    )
+    st.plotly_chart(fig2, use_container_width=True)
+
     st.markdown("#### Partner detail table")
-    table = filtered.copy().sort_values(["player", "avg_net_elo"], ascending=[True, False])
+    st.caption("One row per partnership. A+B and B+A are combined.")
     st.dataframe(
-        table[["player", "partner", "matches", "wins", "losses", "win_rate", "avg_net_elo", "avg_elo_gained", "avg_elo_lost", "elo_gained", "elo_lost_abs", "net_elo"]],
+        pair_table[["partnership", "matches", "wins", "losses", "win_rate", "avg_net_elo", "avg_elo_gained", "avg_elo_lost", "elo_gained", "elo_lost_abs", "net_elo"]],
         use_container_width=True,
         hide_index=True,
         column_config={
@@ -1321,6 +1379,472 @@ def render_partner_matrix_page(players_df: pd.DataFrame, matches_df: pd.DataFram
         },
     )
 
+
+def _expected_score_from_elos(rating_a: float, rating_b: float) -> float:
+    return 1.0 / (1.0 + 10 ** ((rating_b - rating_a) / 400))
+
+
+def _avg_team_elo(player_ids: list[str], elo_map: dict[str, float]) -> float:
+    vals = [float(elo_map.get(str(pid), BASE_ELO)) for pid in player_ids]
+    return sum(vals) / len(vals) if vals else float(BASE_ELO)
+
+
+def _team_label(player_ids: list[str], players_lookup: dict[str, str]) -> str:
+    return " / ".join(players_lookup.get(str(pid), str(pid)) for pid in player_ids)
+
+
+def _historical_matchup_stats(
+    team_a_ids: list[str],
+    team_b_ids: list[str],
+    match_type: str,
+    matches_df: pd.DataFrame,
+    participants_df: pd.DataFrame,
+) -> dict[str, float | int]:
+    if matches_df.empty or participants_df.empty:
+        return {"historical_matches": 0, "avg_margin": None, "historical_closeness": None}
+
+    a_set = frozenset(str(x) for x in team_a_ids)
+    b_set = frozenset(str(x) for x in team_b_ids)
+    margins: list[float] = []
+
+    matches = matches_df.copy()
+    participants = participants_df.copy()
+    matches["match_id"] = matches["match_id"].astype(str)
+    participants["match_id"] = participants["match_id"].astype(str)
+    participants["player_id"] = participants["player_id"].astype(str)
+    participants["team"] = participants["team"].astype(str)
+
+    completed = matches[
+        matches["status"].astype(str).str.lower().eq("completed")
+        & matches["match_type"].astype(str).str.lower().eq(match_type.lower())
+    ].copy()
+
+    for _, match in completed.iterrows():
+        match_id = str(match["match_id"])
+        p = participants[participants["match_id"] == match_id]
+        if p.empty:
+            continue
+        hist_a = frozenset(p.loc[p["team"] == "A", "player_id"].astype(str).tolist())
+        hist_b = frozenset(p.loc[p["team"] == "B", "player_id"].astype(str).tolist())
+        same_setup = (hist_a == a_set and hist_b == b_set) or (hist_a == b_set and hist_b == a_set)
+        if not same_setup:
+            continue
+        score_a = pd.to_numeric(pd.Series([match.get("team_a_score", 0)]), errors="coerce").fillna(0).iloc[0]
+        score_b = pd.to_numeric(pd.Series([match.get("team_b_score", 0)]), errors="coerce").fillna(0).iloc[0]
+        margins.append(abs(float(score_a) - float(score_b)))
+
+    if not margins:
+        return {"historical_matches": 0, "avg_margin": None, "historical_closeness": None}
+
+    avg_margin = float(sum(margins) / len(margins))
+    historical_closeness = max(0.0, 100.0 - min(avg_margin, 21.0) / 21.0 * 100.0)
+    return {"historical_matches": len(margins), "avg_margin": avg_margin, "historical_closeness": historical_closeness}
+
+
+
+def build_matchup_recommendations(
+    present_ids: list[str],
+    match_type: str,
+    player_weights: dict[str, float],
+    matches_df: pd.DataFrame,
+    participants_df: pd.DataFrame,
+    elo_history_df: pd.DataFrame,
+    players_df: pd.DataFrame,
+    players_lookup: dict[str, str],
+) -> pd.DataFrame:
+    """Generate all valid matchups and rank them by closeness/interesting score.
+
+    Random picking is deliberately handled separately using rejection sampling, so this
+    table remains a transparent ranking of all possible games.
+    """
+    present_ids = [str(pid) for pid in present_ids]
+    elo_map = current_elo_map(players_df, elo_history_df)
+    rows: list[dict] = []
+
+    def add_candidate(team_a: list[str], team_b: list[str]) -> None:
+        all_ids = team_a + team_b
+        weights = [float(player_weights.get(pid, 1.0)) for pid in all_ids]
+        if any(w <= 0 for w in weights):
+            return
+
+        team_a_elo = _avg_team_elo(team_a, elo_map)
+        team_b_elo = _avg_team_elo(team_b, elo_map)
+        exp_a = _expected_score_from_elos(team_a_elo, team_b_elo)
+        expected_diff = abs(exp_a - 0.5)
+        elo_closeness = max(0.0, (1.0 - expected_diff * 2.0) * 100.0)
+        history = _historical_matchup_stats(team_a, team_b, match_type, matches_df, participants_df)
+        historical_closeness = history.get("historical_closeness")
+        if historical_closeness is None:
+            game_quality_score = elo_closeness
+        else:
+            game_quality_score = (0.72 * elo_closeness) + (0.28 * float(historical_closeness))
+
+        avg_weight = sum(weights) / len(weights)
+        rows.append({
+            "match_type": match_type,
+            "team_a_ids": "|".join(team_a),
+            "team_b_ids": "|".join(team_b),
+            "playing_ids": "|".join(all_ids),
+            "team_a": _team_label(team_a, players_lookup),
+            "team_b": _team_label(team_b, players_lookup),
+            "matchup": f"{_team_label(team_a, players_lookup)} vs {_team_label(team_b, players_lookup)}",
+            "team_a_elo": round(team_a_elo, 1),
+            "team_b_elo": round(team_b_elo, 1),
+            "elo_gap": round(abs(team_a_elo - team_b_elo), 1),
+            "expected_team_a_win": round(exp_a * 100, 1),
+            "elo_closeness": round(elo_closeness, 1),
+            "historical_matches": int(history.get("historical_matches", 0) or 0),
+            "avg_margin": None if history.get("avg_margin") is None else round(float(history.get("avg_margin")), 1),
+            "historical_closeness": None if historical_closeness is None else round(float(historical_closeness), 1),
+            "game_quality_score": round(game_quality_score, 1),
+            "recommendation_score": round(game_quality_score, 1),
+            "interest_score": round(game_quality_score, 1),
+            # This is intentionally independent of closeness. Closeness is applied later
+            # through the acceptance/rejection rule, not by biasing the initial random draw.
+            "random_weight": max(0.01, float(avg_weight)),
+        })
+
+    eligible_ids = [pid for pid in present_ids if float(player_weights.get(pid, 1.0)) > 0]
+    if match_type == "Singles":
+        for a, b in combinations(eligible_ids, 2):
+            add_candidate([a], [b])
+    else:
+        seen: set[tuple[tuple[str, ...], tuple[str, ...]]] = set()
+        teams = [tuple(sorted(team)) for team in combinations(eligible_ids, 2)]
+        for team_a in teams:
+            for team_b in teams:
+                if set(team_a) & set(team_b):
+                    continue
+                key = tuple(sorted([team_a, team_b]))
+                if key in seen:
+                    continue
+                seen.add(key)
+                add_candidate(list(team_a), list(team_b))
+
+    if not rows:
+        return pd.DataFrame()
+    return pd.DataFrame(rows).sort_values(["game_quality_score", "elo_closeness", "historical_matches"], ascending=[False, False, False])
+
+
+
+def _weighted_draw_without_replacement(items: list[str], weights: dict[str, float], k: int) -> list[str]:
+    remaining = [str(item) for item in items if float(weights.get(str(item), 1.0)) > 0]
+    chosen: list[str] = []
+    for _ in range(min(k, len(remaining))):
+        draw_weights = [max(0.0, float(weights.get(pid, 1.0))) for pid in remaining]
+        if not remaining or sum(draw_weights) <= 0:
+            break
+        picked = random.choices(remaining, weights=draw_weights, k=1)[0]
+        chosen.append(picked)
+        remaining.remove(picked)
+    return chosen
+
+
+def _top_and_bottom_groups(player_ids: list[str], elo_map: dict[str, float]) -> tuple[list[str], list[str]]:
+    ranked_low_to_high = sorted([str(pid) for pid in player_ids], key=lambda pid: float(elo_map.get(pid, BASE_ELO)))
+    bottom_three = ranked_low_to_high[:3]
+    top_two = list(reversed(ranked_low_to_high[-2:])) if len(ranked_low_to_high) >= 2 else []
+    return top_two, bottom_three
+
+
+def _prohibited_matchup(team_a: list[str], team_b: list[str], top_two: list[str], bottom_three: list[str], match_type: str) -> bool:
+    if not bottom_three:
+        return False
+
+    bottom_player = bottom_three[0]
+    other_bottom_players = set(bottom_three[1:3])
+    top_set = set(top_two[:2])
+
+    if match_type == "Singles":
+        if bottom_player in team_a and any(pid in top_set for pid in team_b):
+            return True
+        if bottom_player in team_b and any(pid in top_set for pid in team_a):
+            return True
+        return False
+
+    # Doubles rules.
+    if bottom_player not in team_a and bottom_player not in team_b:
+        return False
+
+    bottom_team = team_a if bottom_player in team_a else team_b
+    opponent_team = team_b if bottom_player in team_a else team_a
+    partner = next((pid for pid in bottom_team if pid != bottom_player), "")
+
+    # Lowest player should not partner the other low-ranked players.
+    if partner in other_bottom_players:
+        return True
+
+    opponent_top_players = [pid for pid in opponent_team if pid in top_set]
+    if opponent_top_players:
+        # If the bottom player faces a top player, the bottom player's partner must be
+        # the other top player. If both top players are opponents, this cannot be satisfied.
+        possible_required_partners = [pid for pid in top_two[:2] if pid not in opponent_top_players]
+        if len(possible_required_partners) != 1:
+            return True
+        if partner != possible_required_partners[0]:
+            return True
+
+    return False
+
+
+def _random_elo_rule_matchup(
+    present_ids: list[str],
+    match_type: str,
+    player_weights: dict[str, float],
+    players_df: pd.DataFrame,
+    elo_history_df: pd.DataFrame,
+    players_lookup: dict[str, str],
+    forced_ids: list[str] | None = None,
+    elo_overrides: dict[str, float] | None = None,
+    max_attempts: int = 600,
+) -> dict:
+    eligible_ids = [str(pid) for pid in present_ids if float(player_weights.get(str(pid), 1.0)) > 0]
+    needed = 2 if match_type == "Singles" else 4
+    if len(eligible_ids) < needed:
+        return {}
+
+    elo_map = current_elo_map(players_df, elo_history_df)
+    if elo_overrides:
+        elo_map.update({str(pid): float(value) for pid, value in elo_overrides.items()})
+
+    forced_ids = [str(pid) for pid in (forced_ids or []) if str(pid) in eligible_ids]
+    if len(forced_ids) > needed:
+        forced_ids = forced_ids[:needed]
+
+    top_two, bottom_three = _top_and_bottom_groups(eligible_ids, elo_map)
+
+    for attempt in range(1, max_attempts + 1):
+        remaining_slots = needed - len(forced_ids)
+        remaining_pool = [pid for pid in eligible_ids if pid not in forced_ids]
+        picked = list(forced_ids) + _weighted_draw_without_replacement(remaining_pool, player_weights, remaining_slots)
+        if len(picked) < needed:
+            return {}
+        random.shuffle(picked)
+
+        if match_type == "Singles":
+            team_a = [picked[0]]
+            team_b = [picked[1]]
+        else:
+            # Draw players one-by-one, then randomly choose team split/order. This avoids
+            # generating all possible partnerings just to sample one.
+            if random.random() < 0.5:
+                team_a = [picked[0], picked[1]]
+                team_b = [picked[2], picked[3]]
+            else:
+                team_a = [picked[0], picked[2]]
+                team_b = [picked[1], picked[3]]
+            if random.random() < 0.5:
+                team_a, team_b = team_b, team_a
+
+        if _prohibited_matchup(team_a, team_b, top_two, bottom_three, match_type):
+            continue
+
+        team_a_elo = _avg_team_elo(team_a, elo_map)
+        team_b_elo = _avg_team_elo(team_b, elo_map)
+        exp_a = _expected_score_from_elos(team_a_elo, team_b_elo)
+        elo_gap = abs(team_a_elo - team_b_elo)
+        elo_closeness = max(0.0, (1.0 - abs(exp_a - 0.5) * 2.0) * 100.0)
+
+        team_a_ratings = [float(elo_map.get(pid, BASE_ELO)) for pid in team_a]
+        team_b_ratings = [float(elo_map.get(pid, BASE_ELO)) for pid in team_b]
+        a_win_a_new, a_win_b_new = update_team_elos(team_a_ratings, team_b_ratings, "A")
+        b_win_a_new, b_win_b_new = update_team_elos(team_a_ratings, team_b_ratings, "B")
+        team_a_win_delta = sum(new - old for new, old in zip(a_win_a_new, team_a_ratings)) / len(team_a_ratings)
+        team_b_loss_delta = sum(new - old for new, old in zip(a_win_b_new, team_b_ratings)) / len(team_b_ratings)
+        team_a_loss_delta = sum(new - old for new, old in zip(b_win_a_new, team_a_ratings)) / len(team_a_ratings)
+        team_b_win_delta = sum(new - old for new, old in zip(b_win_b_new, team_b_ratings)) / len(team_b_ratings)
+
+        return {
+            "match_type": match_type,
+            "team_a_ids": "|".join(team_a),
+            "team_b_ids": "|".join(team_b),
+            "team_a": _team_label(team_a, players_lookup),
+            "team_b": _team_label(team_b, players_lookup),
+            "matchup": f"{_team_label(team_a, players_lookup)} vs {_team_label(team_b, players_lookup)}",
+            "team_a_elo": round(team_a_elo, 1),
+            "team_b_elo": round(team_b_elo, 1),
+            "elo_gap": round(elo_gap, 1),
+            "expected_team_a_win": round(exp_a * 100.0, 1),
+            "elo_closeness": round(elo_closeness, 1),
+            "team_a_win_delta": round(team_a_win_delta, 1),
+            "team_b_loss_delta": round(team_b_loss_delta, 1),
+            "team_a_loss_delta": round(team_a_loss_delta, 1),
+            "team_b_win_delta": round(team_b_win_delta, 1),
+            "attempts": attempt,
+        }
+
+    return {}
+
+
+def render_matchup_recommender_page(players_df: pd.DataFrame, matches_df: pd.DataFrame, participants_df: pd.DataFrame, elo_history_df: pd.DataFrame, players_lookup: dict[str, str]) -> None:
+    st.subheader("Matchup recommender")
+    st.caption("Draws a random matchup using manual weights and current Elo. Rotation is session-only and does not write to Supabase or any tables.")
+
+    if players_df.empty:
+        st.info("Add players first.")
+        return
+
+    active_players = players_df[players_df["is_active"].astype(str).str.lower().isin(["true", "1", "yes"])].copy()
+    if active_players.empty:
+        active_players = players_df.copy()
+
+    name_to_id = {str(row["name"]): str(row["player_id"]) for _, row in active_players.iterrows()}
+    player_names = sorted(name_to_id.keys())
+
+    c1, c2, c3 = st.columns([0.8, 1.7, 0.9])
+    match_type = c1.selectbox("Game type", ["Doubles", "Singles"], key="recommender_match_type")
+    default_count = min(8, len(player_names))
+    present_names = c2.multiselect("Players present", player_names, default=player_names[:default_count], key="recommender_present_players")
+    bench_limit = int(c3.number_input("Max bench rounds", min_value=1, max_value=10, value=3, step=1, key="recommender_bench_limit"))
+
+    players_lookup_local = dict(players_lookup)
+    elo_overrides: dict[str, float] = {}
+
+    with st.expander("Add temporary player for this draw only", expanded=False):
+        add_temp = st.checkbox("Include temporary player", key="recommender_include_temp")
+        t1, t2, t3 = st.columns([1.4, 0.8, 0.8])
+        temp_name_raw = t1.text_input("Temporary player name", value="Guest", key="recommender_temp_name")
+        temp_elo = float(t2.number_input("Temporary Elo", min_value=400, max_value=2500, value=1000, step=25, key="recommender_temp_elo"))
+        temp_weight = float(t3.number_input("Temporary weight", min_value=0.0, max_value=5.0, value=1.0, step=0.5, key="recommender_temp_weight"))
+        st.caption("Temporary players are only used in this random draw session. They are not saved to players, matches, Elo history, or Supabase.")
+
+    present_ids = [name_to_id[name] for name in present_names if name in name_to_id]
+    temp_id = ""
+    if add_temp and str(temp_name_raw).strip():
+        safe_temp = re.sub(r"[^a-zA-Z0-9]+", "_", str(temp_name_raw).strip()).strip("_") or "guest"
+        temp_id = f"__temp_{safe_temp.lower()}"
+        players_lookup_local[temp_id] = f"{str(temp_name_raw).strip()} (temp)"
+        elo_overrides[temp_id] = temp_elo
+        if temp_id not in present_ids:
+            present_ids.append(temp_id)
+
+    min_needed = 4 if match_type == "Doubles" else 2
+    if len(present_ids) < min_needed:
+        st.warning(f"Select at least {min_needed} players for {match_type.lower()}.")
+        return
+
+    st.markdown("#### Manual player weights")
+    st.caption("Higher weight means that player is more likely to be drawn. Set weight to 0 to exclude them from the random draw.")
+    weight_cols = st.columns(4)
+    player_weights: dict[str, float] = {}
+    for idx, pid in enumerate(present_ids):
+        display_name = players_lookup_local.get(pid, pid)
+        default_weight = temp_weight if pid == temp_id else 1.0
+        player_weights[pid] = weight_cols[idx % 4].number_input(
+            display_name,
+            min_value=0.0,
+            max_value=5.0,
+            value=float(default_weight),
+            step=0.5,
+            key=f"recommender_weight_{pid}",
+        )
+
+    eligible_ids = [pid for pid in present_ids if float(player_weights.get(pid, 1.0)) > 0]
+    if len(eligible_ids) < min_needed:
+        st.warning(f"At least {min_needed} players need weight above 0.")
+        return
+
+    bench_streaks = st.session_state.setdefault("recommender_bench_streaks", {})
+    games_played = st.session_state.setdefault("recommender_games_played", {})
+    for pid in eligible_ids:
+        bench_streaks.setdefault(pid, 0)
+        games_played.setdefault(pid, 0)
+
+    due_ids = sorted(
+        [pid for pid in eligible_ids if int(bench_streaks.get(pid, 0)) >= bench_limit],
+        key=lambda pid: (int(bench_streaks.get(pid, 0)), float(player_weights.get(pid, 1.0))),
+        reverse=True,
+    )
+    forced_ids = due_ids[:min_needed]
+
+    elo_map = current_elo_map(players_df, elo_history_df)
+    elo_map.update(elo_overrides)
+    present_summary = pd.DataFrame([
+        {
+            "player": players_lookup_local.get(pid, pid),
+            "current_elo": float(elo_map.get(pid, BASE_ELO)),
+            "manual_weight": float(player_weights.get(pid, 1.0)),
+            "games_played_session": int(games_played.get(pid, 0)),
+            "bench_streak": int(bench_streaks.get(pid, 0)),
+            "status": "Due now" if pid in forced_ids else ("Due soon" if int(bench_streaks.get(pid, 0)) >= max(0, bench_limit - 1) else "Available"),
+        }
+        for pid in present_ids
+    ]).sort_values(["bench_streak", "current_elo"], ascending=[False, False])
+
+    with st.expander("Show present player Elo and rotation table", expanded=False):
+        st.dataframe(
+            present_summary,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "current_elo": st.column_config.NumberColumn("Current Elo", format="%.0f"),
+                "manual_weight": st.column_config.NumberColumn("Manual weight", format="%.1f"),
+                "games_played_session": "Played this session",
+                "bench_streak": "Bench streak",
+            },
+        )
+
+    control_cols = st.columns([1.2, 1, 1])
+    pick_clicked = control_cols[0].button("Pick random matchup", type="primary", use_container_width=True)
+    reset_clicked = control_cols[1].button("Reset session rotation", use_container_width=True)
+    clear_clicked = control_cols[2].button("Clear suggestion", use_container_width=True)
+
+    if reset_clicked:
+        st.session_state["recommender_bench_streaks"] = {pid: 0 for pid in eligible_ids}
+        st.session_state["recommender_games_played"] = {pid: 0 for pid in eligible_ids}
+        st.session_state["recommended_matchup_choice"] = {}
+        st.rerun()
+
+    if clear_clicked:
+        st.session_state["recommended_matchup_choice"] = {}
+        st.rerun()
+
+    if pick_clicked:
+        choice = _random_elo_rule_matchup(
+            present_ids=present_ids,
+            match_type=match_type,
+            player_weights=player_weights,
+            players_df=players_df,
+            elo_history_df=elo_history_df,
+            players_lookup=players_lookup_local,
+            forced_ids=forced_ids,
+            elo_overrides=elo_overrides,
+        )
+        st.session_state["recommended_matchup_choice"] = choice
+        st.rerun()
+
+    choice = st.session_state.get("recommended_matchup_choice")
+    if choice:
+        if not choice:
+            st.warning("Could not find a valid matchup with the current players and weights. Try adding more players or adjusting weights.")
+        else:
+            st.success(f"Suggested game: {choice['matchup']}")
+            m1, m2, m3, m4 = st.columns(4)
+            m1.metric("Team A Elo", f"{float(choice['team_a_elo']):.0f}")
+            m2.metric("Team B Elo", f"{float(choice['team_b_elo']):.0f}")
+            m3.metric("Elo gap", f"{float(choice['elo_gap']):.0f}")
+            m4.metric("Expected Team A win", f"{float(choice['expected_team_a_win']):.1f}%")
+
+            st.markdown("##### Elo on the line")
+            e1, e2 = st.columns(2)
+            e1.info(f"If **Team A wins**: Team A players {float(choice['team_a_win_delta']):+.1f} Elo each; Team B players {float(choice['team_b_loss_delta']):+.1f} Elo each.")
+            e2.info(f"If **Team B wins**: Team B players {float(choice['team_b_win_delta']):+.1f} Elo each; Team A players {float(choice['team_a_loss_delta']):+.1f} Elo each.")
+            st.caption(f"Closeness from Elo only: {float(choice['elo_closeness']):.1f}/100")
+
+            if st.button("Accept/use this matchup and update bench rotation", use_container_width=True):
+                played_ids = [pid for pid in str(choice.get("team_a_ids", "")).split("|") + str(choice.get("team_b_ids", "")).split("|") if pid]
+                played_set = set(played_ids)
+                for pid in eligible_ids:
+                    if pid in played_set:
+                        bench_streaks[pid] = 0
+                        games_played[pid] = int(games_played.get(pid, 0)) + 1
+                    else:
+                        bench_streaks[pid] = int(bench_streaks.get(pid, 0)) + 1
+                st.session_state["recommender_bench_streaks"] = bench_streaks
+                st.session_state["recommender_games_played"] = games_played
+                st.session_state["recommended_matchup_choice"] = {}
+                st.success("Rotation updated for this session.")
+                st.rerun()
 
 def render_player_relationship_highlights(selected_pid: str, matches_df: pd.DataFrame, participants_df: pd.DataFrame, elo_history_df: pd.DataFrame, players_lookup: dict[str, str]) -> None:
     insights = build_player_relationship_insights(selected_pid, matches_df, participants_df, elo_history_df, players_lookup)
@@ -1994,8 +2518,8 @@ stats_df = build_player_stats(players_df, matches_df, events_df, elo_history_df,
 review_df = build_event_review_df(events_df, matches_df, players_lookup)
 render_top_summary(players_df, matches_df, review_df)
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11 = st.tabs([
-    "🎬 Live Match", "🏅 Elo", "📊 Stats", "🤝 Partners", "🗂️ Matches", "✅ Good Shots", "❌ Bad Shots", "⭐ Highlights", "🧍 Player Explorer", "📅 Match History", "🛠️ Admin"
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9, tab10, tab11, tab12 = st.tabs([
+    "🎬 Live Match", "🏅 Elo", "📊 Stats", "🤝 Partners", "🎲 Recommender", "🗂️ Matches", "✅ Good Shots", "❌ Bad Shots", "⭐ Highlights", "🧍 Player Explorer", "📅 Match History", "🛠️ Admin"
 ])
 
 with tab1:
@@ -2270,6 +2794,9 @@ with tab4:
     render_partner_matrix_page(players_df, matches_df, match_participants_df, elo_history_df, players_lookup)
 
 with tab5:
+    render_matchup_recommender_page(players_df, matches_df, match_participants_df, elo_history_df, players_lookup)
+
+with tab6:
     st.subheader("Matches")
     matches_view = add_match_display_columns(matches_df, players_lookup)
     if matches_view.empty:
@@ -2391,20 +2918,20 @@ with tab5:
                 mime="text/csv",
             )
 
-with tab6:
+with tab7:
     render_event_review_page("Good Shots", review_df, "good_shot", players_lookup)
 
-with tab7:
+with tab8:
     render_event_review_page("Bad Shots", review_df, "bad_shot", players_lookup)
 
-with tab8:
+with tab9:
     render_event_review_page("Highlights", review_df, "highlight", players_lookup)
 
-with tab9:
+with tab10:
     render_player_explorer(players_df, stats_df, review_df, matches_df, players_lookup)
 
 
-with tab10:
+with tab11:
     st.subheader("Match History")
     history = matches_df.copy()
     if history.empty:
@@ -2438,7 +2965,7 @@ with tab10:
             st.plotly_chart(match_chart, use_container_width=True)
 
 
-with tab11:
+with tab12:
     st.subheader("Admin tools")
     if current_role != "admin":
         st.info("General Viewer mode: admin tools are hidden.")
