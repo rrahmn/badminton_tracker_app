@@ -723,3 +723,143 @@ def summarise_replacement_benchmark(benchmark_df: pd.DataFrame) -> pd.DataFrame:
     others_avg = float(others["avg_performance_pp"].mean()) if not others.empty else 0.0
     summary["replacement_value_pp"] = summary["avg_performance_pp"] - others_avg
     return summary.sort_values(["avg_performance_pp", "matches", "win_rate"], ascending=[False, False, False])
+
+
+def _match_display_date(match: pd.Series):
+    candidates = [
+        str(match.get("scheduled_date", "") or "").strip(),
+        str(match.get("completed_at", "") or "").strip(),
+        str(match.get("created_at", "") or "").strip(),
+    ]
+    for value in candidates:
+        if not value:
+            continue
+        parsed = pd.to_datetime(value, errors="coerce")
+        if not pd.isna(parsed):
+            return parsed
+    return pd.NaT
+
+
+def build_player_elo_relationship_timeline_df(
+    selected_pid: str,
+    matches_df: pd.DataFrame,
+    participants_df: pd.DataFrame,
+    elo_history_df: pd.DataFrame,
+    players_lookup: dict[str, str],
+) -> pd.DataFrame:
+    """One row per completed match for the selected player.
+
+    This powers the Elo relationship-impact timeline. It keeps all relationships
+    available so the UI can filter by partner, opponent 1, opponent 2 and format.
+    """
+    if not selected_pid or matches_df.empty or participants_df.empty:
+        return pd.DataFrame()
+
+    matches = matches_df.copy().reset_index(drop=False).rename(columns={"index": "_match_row_order"})
+    participants = participants_df.copy()
+    history = elo_history_df.copy()
+
+    matches["match_id"] = matches["match_id"].astype(str)
+    participants["match_id"] = participants["match_id"].astype(str)
+    participants["player_id"] = participants["player_id"].astype(str)
+    participants["team"] = participants["team"].astype(str)
+    if not history.empty:
+        history["match_id"] = history["match_id"].astype(str)
+        history["player_id"] = history["player_id"].astype(str)
+        history["delta"] = pd.to_numeric(history["delta"], errors="coerce").fillna(0)
+        history["old_elo"] = pd.to_numeric(history["old_elo"], errors="coerce").fillna(BASE_ELO)
+        history["new_elo"] = pd.to_numeric(history["new_elo"], errors="coerce").fillna(BASE_ELO)
+
+    completed = matches[
+        matches["status"].astype(str).str.lower().eq("completed")
+        & matches["winner"].astype(str).isin(["A", "B"])
+    ].copy()
+
+    rows: list[dict] = []
+    for _, match in completed.iterrows():
+        match_id = str(match.get("match_id", "") or "")
+        p_match = participants[participants["match_id"] == match_id].copy()
+        selected_rows = p_match[p_match["player_id"] == str(selected_pid)]
+        if selected_rows.empty:
+            continue
+
+        selected_team = str(selected_rows.iloc[0]["team"])
+        team_rows = p_match[p_match["team"] == selected_team]
+        opponent_rows = p_match[p_match["team"] != selected_team]
+        team_ids = team_rows["player_id"].astype(str).tolist()
+        opponent_ids = opponent_rows["player_id"].astype(str).tolist()
+        partner_ids = [pid for pid in team_ids if pid != str(selected_pid)]
+
+        h_rows = history[(history["match_id"] == match_id) & (history["player_id"] == str(selected_pid))] if not history.empty else pd.DataFrame()
+        elo_delta = float(h_rows["delta"].sum()) if not h_rows.empty else 0.0
+        old_elo = float(h_rows["old_elo"].iloc[0]) if not h_rows.empty else BASE_ELO
+        new_elo = float(h_rows["new_elo"].iloc[-1]) if not h_rows.empty else old_elo + elo_delta
+
+        team_score, opp_score = _team_score_for_match(match, selected_team)
+        won = str(match.get("winner", "")) == selected_team
+        match_date = _match_display_date(match)
+        match_type = str(match.get("match_type", "") or "")
+        if not match_type:
+            match_type = "Doubles" if len(team_ids) > 1 else "Singles"
+
+        rows.append({
+            "match_id": match_id,
+            "match_row_order": int(match.get("_match_row_order", 0)),
+            "match_date": match_date,
+            "match_date_label": match_date.strftime("%Y-%m-%d") if not pd.isna(match_date) else "",
+            "selected_player_id": str(selected_pid),
+            "selected_player": players_lookup.get(str(selected_pid), str(selected_pid)),
+            "match_type": match_type,
+            "format": "Doubles" if len(team_ids) > 1 else "Singles",
+            "selected_team": selected_team,
+            "partner_ids": "|".join(partner_ids),
+            "partner_names": " / ".join(players_lookup.get(pid, pid) for pid in partner_ids) if partner_ids else "Singles",
+            "opponent_ids": "|".join(opponent_ids),
+            "opponent_names": " / ".join(players_lookup.get(pid, pid) for pid in opponent_ids),
+            "team_score": team_score,
+            "opponent_score": opp_score,
+            "score_label": f"{team_score} - {opp_score}",
+            "result": "Win" if won else "Loss",
+            "won": bool(won),
+            "elo_delta": elo_delta,
+            "old_elo": old_elo,
+            "new_elo": new_elo,
+            "video_url": str(match.get("video_url", "") or ""),
+            "notes": str(match.get("notes", "") or ""),
+            "team_a_names": str(match.get("team_a_names", "") or ""),
+            "team_b_names": str(match.get("team_b_names", "") or ""),
+        })
+
+    if not rows:
+        return pd.DataFrame()
+
+    out = pd.DataFrame(rows)
+    out["match_date"] = pd.to_datetime(out["match_date"], errors="coerce")
+    out = out.sort_values(["match_date", "match_row_order", "match_id"], na_position="last").reset_index(drop=True)
+
+    # Use real match date gaps, but spread matches inside the same day so they do
+    # not sit on top of each other after CSV imports.
+    order = out[["match_id", "match_date", "match_row_order"]].drop_duplicates("match_id").copy()
+    order["date_group"] = order["match_date"].dt.date.astype(str)
+    order["day_order"] = order.groupby("date_group").cumcount()
+    order["day_count"] = order.groupby("date_group")["match_id"].transform("count")
+    order["spread_minutes"] = 120 + ((order["day_order"] + 1) * (20 * 60 / (order["day_count"] + 1)))
+    order["chart_x_dt"] = order["match_date"].dt.normalize() + pd.to_timedelta(order["spread_minutes"], unit="m")
+    out = out.merge(order[["match_id", "chart_x_dt"]], on="match_id", how="left")
+    out["chart_x_dt"] = out["chart_x_dt"].fillna(out["match_date"])
+    out["abs_elo_delta"] = out["elo_delta"].abs()
+    out["delta_label"] = out["elo_delta"].apply(lambda x: f"{x:+.0f}")
+    out["hover_details"] = out.apply(
+        lambda r: (
+            f"<b>{r['selected_player']}: {r['delta_label']} Elo</b><br>"
+            f"Date: {r['match_date_label']}<br>"
+            f"Format: {r['format']} | Result: {r['result']}<br>"
+            f"Score: {r['score_label']}<br>"
+            f"Partner: {r['partner_names']}<br>"
+            f"Opponents: {r['opponent_names']}<br>"
+            f"Elo: {float(r['old_elo']):.0f} → {float(r['new_elo']):.0f}<br>"
+            f"Video: {r['video_url'] or '—'}"
+        ),
+        axis=1,
+    )
+    return out

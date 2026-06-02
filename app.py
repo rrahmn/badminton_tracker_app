@@ -14,7 +14,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from src.auth import auth_is_configured, get_display_name, get_role, logout, require_editor, require_login
-from src.analytics import build_elo_timeline_df, build_partner_matrix_df, build_player_relationship_insights, build_player_loss_risk_df, build_player_head_to_head_df, build_player_match_timeline_df, build_player_clutch_summary_df, build_player_context_setup_options, build_replacement_benchmark_df, summarise_replacement_benchmark
+from src.analytics import build_elo_timeline_df, build_partner_matrix_df, build_player_relationship_insights, build_player_loss_risk_df, build_player_head_to_head_df, build_player_match_timeline_df, build_player_clutch_summary_df, build_player_context_setup_options, build_replacement_benchmark_df, summarise_replacement_benchmark, build_player_elo_relationship_timeline_df
 from src.elo import BASE_ELO, ELO_MODEL_VERSION, K_FACTOR, update_team_elos
 from src.stats import build_player_stats, current_elo_map
 from src.storage import CSVStorage, SupabaseStorage, DATA_FILES
@@ -1025,6 +1025,239 @@ def render_elo_history_page(players_df: pd.DataFrame, matches_df: pd.DataFrame, 
         if str(event_row.get("video_url", "") or "").strip():
             st.markdown(f"**Video:** [Open video]({event_row.get('video_url')})")
         st.write(f"**Notes:** {event_row.get('notes', '') or '—'}")
+
+    st.divider()
+    render_player_elo_relationship_impact_page(players_df, matches_df, match_participants_df, elo_history_df, players_lookup)
+
+
+
+def _option_id_from_name(players_df: pd.DataFrame, name: str, default: str = "") -> str:
+    if not name or name.startswith("Any"):
+        return default
+    rows = players_df[players_df["name"].astype(str) == str(name)]
+    if rows.empty:
+        return default
+    return str(rows.iloc[0]["player_id"])
+
+
+def _id_pipe_contains(pipe_value: str, player_id: str) -> bool:
+    if not player_id:
+        return True
+    return str(player_id) in [x for x in str(pipe_value or "").split("|") if x]
+
+
+def render_player_elo_relationship_impact_page(players_df: pd.DataFrame, matches_df: pd.DataFrame, participants_df: pd.DataFrame, elo_history_df: pd.DataFrame, players_lookup: dict[str, str]) -> None:
+    st.markdown("#### Relationship Elo impact")
+    st.caption("Choose one player and optional relationship filters. The two charts use the same filtered games: per-match impact on the left, cumulative impact on the right.")
+
+    if players_df.empty:
+        st.info("Add players first.")
+        return
+
+    def _split_pipe_ids(value: str) -> list[str]:
+        return [x for x in str(value or "").split("|") if x]
+
+    def _names_from_id_series(series: pd.Series) -> list[str]:
+        ids: set[str] = set()
+        for value in series.fillna("").astype(str):
+            ids.update(_split_pipe_ids(value))
+        return sorted(players_lookup.get(pid, pid) for pid in ids if pid in players_lookup)
+
+    def _keep_valid_selectbox_value(key: str, options: list[str], default: str) -> None:
+        if st.session_state.get(key) not in options:
+            st.session_state[key] = default
+
+    name_options = players_df["name"].astype(str).sort_values().tolist()
+    f1, f2 = st.columns([1.2, 1])
+    evaluated_name = f1.selectbox("Player being evaluated", name_options, key="relationship_impact_player")
+    evaluated_pid = _option_id_from_name(players_df, evaluated_name)
+    format_filter = f2.selectbox("Format", ["All", "Singles", "Doubles"], key="relationship_impact_format")
+
+    timeline = build_player_elo_relationship_timeline_df(evaluated_pid, matches_df, participants_df, elo_history_df, players_lookup)
+    if timeline.empty:
+        st.info("No completed matches with Elo history for this player yet.")
+        return
+
+    option_base = timeline.copy()
+    if format_filter != "All":
+        option_base = option_base[option_base["format"] == format_filter]
+
+    if option_base.empty:
+        st.warning("No games exist for this player with the selected format.")
+        return
+
+    partner_options = ["Any partner"] + _names_from_id_series(option_base["partner_ids"])
+    _keep_valid_selectbox_value("relationship_impact_partner", partner_options, "Any partner")
+    p_col, o1_col, o2_col = st.columns(3)
+    partner_name = p_col.selectbox("Partner filter", partner_options, key="relationship_impact_partner")
+    partner_id = _option_id_from_name(players_df, partner_name)
+
+    opponent_option_base = option_base.copy()
+    if partner_id:
+        opponent_option_base = opponent_option_base[opponent_option_base["partner_ids"].apply(lambda value: _id_pipe_contains(value, partner_id))]
+
+    opponent1_options = ["Any opponent"] + _names_from_id_series(opponent_option_base["opponent_ids"])
+    _keep_valid_selectbox_value("relationship_impact_opp1", opponent1_options, "Any opponent")
+    opponent1_name = o1_col.selectbox("Opponent 1 filter", opponent1_options, key="relationship_impact_opp1")
+    opponent1_id = _option_id_from_name(players_df, opponent1_name)
+
+    opponent2_option_base = opponent_option_base.copy()
+    if opponent1_id:
+        opponent2_option_base = opponent2_option_base[opponent2_option_base["opponent_ids"].apply(lambda value: _id_pipe_contains(value, opponent1_id))]
+    opponent2_options_raw = _names_from_id_series(opponent2_option_base["opponent_ids"])
+    opponent2_options_raw = [name for name in opponent2_options_raw if name != opponent1_name]
+    opponent2_options = ["Any opponent"] + opponent2_options_raw
+    _keep_valid_selectbox_value("relationship_impact_opp2", opponent2_options, "Any opponent")
+    opponent2_name = o2_col.selectbox("Opponent 2 filter", opponent2_options, key="relationship_impact_opp2")
+    opponent2_id = _option_id_from_name(players_df, opponent2_name)
+
+    opponent_ids = [pid for pid in [opponent1_id, opponent2_id] if pid]
+
+    filtered = option_base.copy()
+    if partner_id:
+        filtered = filtered[filtered["partner_ids"].apply(lambda value: _id_pipe_contains(value, partner_id))]
+    for opponent_id in opponent_ids:
+        filtered = filtered[filtered["opponent_ids"].apply(lambda value, oid=opponent_id: _id_pipe_contains(value, oid))]
+
+    if filtered.empty:
+        st.warning("No matches match those filters. Try removing one filter or switching format to All.")
+        return
+
+    filtered = filtered.sort_values(["chart_x_dt", "match_row_order", "match_id"]).copy()
+    filtered["running_total"] = filtered["elo_delta"].cumsum()
+    filtered["positive_elo"] = filtered["elo_delta"].where(filtered["elo_delta"] > 0)
+    filtered["negative_elo"] = filtered["elo_delta"].where(filtered["elo_delta"] < 0)
+    filtered["win_marker_y"] = filtered["elo_delta"].where(filtered["result"] == "Win")
+    filtered["loss_marker_y"] = filtered["elo_delta"].where(filtered["result"] == "Loss")
+
+    total_delta = float(filtered["elo_delta"].sum())
+    avg_delta = float(filtered["elo_delta"].mean())
+    wins = int((filtered["result"] == "Win").sum())
+    matches = int(len(filtered))
+    win_rate = (wins / matches * 100) if matches else 0
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Net Elo impact", f"{total_delta:+.0f}")
+    m2.metric("Average per game", f"{avg_delta:+.1f}")
+    m3.metric("Win rate", f"{win_rate:.1f}%")
+    m4.metric("Matches", matches)
+
+    title_parts = [evaluated_name]
+    if partner_id:
+        title_parts.append(f"with {partner_name}")
+    if opponent_ids:
+        title_parts.append("vs " + " + ".join([players_lookup.get(pid, pid) for pid in opponent_ids]))
+    if format_filter != "All":
+        title_parts.append(f"({format_filter})")
+    title_suffix = " ".join(title_parts)
+
+    chart_cols = st.columns(2)
+    with chart_cols[0]:
+        fig_match = go.Figure()
+        fig_match.add_trace(
+            go.Bar(
+                x=filtered["chart_x_dt"],
+                y=filtered["positive_elo"],
+                name="Elo gained",
+                marker_color="#16803c",
+                customdata=filtered[["hover_details", "video_url"]],
+                hovertemplate="%{customdata[0]}<extra></extra>",
+            )
+        )
+        fig_match.add_trace(
+            go.Bar(
+                x=filtered["chart_x_dt"],
+                y=filtered["negative_elo"],
+                name="Elo lost",
+                marker_color="#b91c1c",
+                customdata=filtered[["hover_details", "video_url"]],
+                hovertemplate="%{customdata[0]}<extra></extra>",
+            )
+        )
+        fig_match.add_trace(
+            go.Scatter(
+                x=filtered["chart_x_dt"],
+                y=filtered["win_marker_y"],
+                name="Win",
+                mode="markers",
+                marker=dict(symbol="triangle-up", size=10, color="#0f172a", line=dict(width=1, color="#ffffff")),
+                customdata=filtered[["hover_details", "video_url"]],
+                hovertemplate="%{customdata[0]}<extra></extra>",
+            )
+        )
+        fig_match.add_trace(
+            go.Scatter(
+                x=filtered["chart_x_dt"],
+                y=filtered["loss_marker_y"],
+                name="Loss",
+                mode="markers",
+                marker=dict(symbol="x", size=10, color="#0f172a", line=dict(width=2, color="#0f172a")),
+                customdata=filtered[["hover_details", "video_url"]],
+                hovertemplate="%{customdata[0]}<extra></extra>",
+            )
+        )
+        fig_match.add_hline(y=0, line_width=1, line_dash="dash", line_color="rgba(120,120,120,.7)")
+        fig_match.update_layout(
+            title="Per-match Elo impact",
+            xaxis_title="Game date, ordered within day",
+            yaxis_title="Elo change",
+            legend_title="Legend",
+            hovermode="closest",
+            height=430,
+            margin=dict(l=20, r=10, t=60, b=40),
+            bargap=0.38,
+        )
+        st.plotly_chart(fig_match, use_container_width=True)
+
+    with chart_cols[1]:
+        fig_cum = go.Figure()
+        fig_cum.add_trace(
+            go.Scatter(
+                x=filtered["chart_x_dt"],
+                y=filtered["running_total"],
+                name="Cumulative Elo impact",
+                mode="lines+markers",
+                line=dict(width=3, color="#2563eb"),
+                marker=dict(size=8, color="#2563eb", line=dict(width=1, color="#ffffff")),
+                customdata=filtered[["hover_details", "running_total", "video_url"]],
+                hovertemplate="%{customdata[0]}<br>Cumulative impact: %{customdata[1]:+.0f}<extra></extra>",
+            )
+        )
+        fig_cum.add_hline(y=0, line_width=1, line_dash="dash", line_color="rgba(120,120,120,.7)")
+        fig_cum.update_layout(
+            title="Cumulative Elo impact",
+            xaxis_title="Game date, ordered within day",
+            yaxis_title="Running total Elo",
+            legend_title="Legend",
+            hovermode="closest",
+            height=430,
+            margin=dict(l=20, r=10, t=60, b=40),
+        )
+        st.plotly_chart(fig_cum, use_container_width=True)
+
+    st.caption("Both charts use the same filters. Left = what each game did to Elo. Right = how those games add up over time. Hover points/bars for score, format, partner/opponents and video URL.")
+
+    review_cols = [
+        "match_date_label", "format", "partner_names", "opponent_names", "result", "score_label",
+        "elo_delta", "running_total", "old_elo", "new_elo", "video_url"
+    ]
+    with st.expander("Show matching games", expanded=False):
+        st.dataframe(
+            filtered[review_cols],
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "match_date_label": "Date",
+                "partner_names": "Partner",
+                "opponent_names": "Opponents",
+                "score_label": "Score",
+                "elo_delta": st.column_config.NumberColumn("Elo change", format="%+.0f"),
+                "running_total": st.column_config.NumberColumn("Running total", format="%+.0f"),
+                "old_elo": st.column_config.NumberColumn("Old Elo", format="%.0f"),
+                "new_elo": st.column_config.NumberColumn("New Elo", format="%.0f"),
+                "video_url": st.column_config.LinkColumn("Video", display_text="Open video"),
+            },
+        )
 
 
 def render_partner_matrix_page(players_df: pd.DataFrame, matches_df: pd.DataFrame, participants_df: pd.DataFrame, elo_history_df: pd.DataFrame, players_lookup: dict[str, str]) -> None:
