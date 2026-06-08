@@ -401,7 +401,7 @@ def apply_elo_for_match(match_id: str, winner: str, match_row: pd.Series | None 
 
     players_df = st.session_state.players_df.copy()
     elo_history = st.session_state.elo_history_df.copy()
-    elo_map = current_elo_map(players_df, elo_history)
+    elo_map = current_elo_map(players_df, elo_history, st.session_state.matches_df)
 
     team_a_ids = get_match_team_ids(match_row, "A")
     team_b_ids = get_match_team_ids(match_row, "B")
@@ -445,23 +445,31 @@ def apply_elo_for_match(match_id: str, winner: str, match_row: pd.Series | None 
 
 
 
-def _match_sort_key(row: pd.Series) -> pd.Timestamp:
-    date_part = str(row.get("scheduled_date", "") or "").strip()
-    time_part = str(row.get("scheduled_time", "") or "").strip()
-    candidates = []
-    if date_part:
-        candidates.append(f"{date_part} {time_part}".strip())
-    candidates.extend([
-        str(row.get("completed_at", "") or "").strip(),
-        str(row.get("created_at", "") or "").strip(),
-    ])
-    for candidate in candidates:
-        if not candidate:
-            continue
-        parsed = pd.to_datetime(candidate, errors="coerce")
-        if not pd.isna(parsed):
-            return parsed
-    return pd.Timestamp.max
+def _coalesced_row_value(row: pd.Series, names: list[str]) -> str:
+    for name in names:
+        value = str(row.get(name, "") or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _match_created_sort_key(row: pd.Series) -> pd.Timestamp:
+    parsed = pd.to_datetime(str(row.get("created_at", "") or "").strip(), errors="coerce")
+    return parsed if not pd.isna(parsed) else pd.Timestamp.max
+
+
+def _match_datetime_sort_key(row: pd.Series) -> pd.Timestamp:
+    date_part = _coalesced_row_value(row, ["scheduled_date", "match_date"])
+    time_part = _coalesced_row_value(row, ["scheduled_time", "match_time"])
+    if not date_part:
+        return pd.Timestamp.max
+    parsed = pd.to_datetime(f"{date_part} {time_part}".strip(), errors="coerce")
+    return parsed if not pd.isna(parsed) else pd.Timestamp.max
+
+
+def _match_completed_sort_key(row: pd.Series) -> pd.Timestamp:
+    parsed = pd.to_datetime(str(row.get("completed_at", "") or "").strip(), errors="coerce")
+    return parsed if not pd.isna(parsed) else pd.Timestamp.max
 
 
 def recalculate_elo_history() -> int:
@@ -483,9 +491,15 @@ def recalculate_elo_history() -> int:
         refresh_state()
         return 0
 
-    completed_matches["_elo_sort_key"] = completed_matches.apply(_match_sort_key, axis=1)
-    completed_matches = completed_matches.sort_values(["_elo_sort_key", "created_at", "match_id"])
+    completed_matches["_created_sort_key"] = completed_matches.apply(_match_created_sort_key, axis=1)
+    completed_matches["_match_datetime_sort_key"] = completed_matches.apply(_match_datetime_sort_key, axis=1)
+    completed_matches["_completed_sort_key"] = completed_matches.apply(_match_completed_sort_key, axis=1)
+    completed_matches = completed_matches.sort_values([
+        "_created_sort_key", "_match_datetime_sort_key", "_completed_sort_key", "match_id"
+    ])
 
+    # Standard Elo replay: start every player from base Elo and replay each match in order.
+    # This deliberately ignores any player's current displayed Elo before the rebuild.
     elo_map = {str(row["player_id"]): BASE_ELO for _, row in st.session_state.players_df.iterrows()}
     rebuilt_rows: list[dict] = []
 
@@ -1458,7 +1472,7 @@ def build_matchup_recommendations(
     table remains a transparent ranking of all possible games.
     """
     present_ids = [str(pid) for pid in present_ids]
-    elo_map = current_elo_map(players_df, elo_history_df)
+    elo_map = current_elo_map(players_df, elo_history_df, matches_df)
     rows: list[dict] = []
 
     def add_candidate(team_a: list[str], team_b: list[str]) -> None:
@@ -1592,6 +1606,7 @@ def _random_elo_rule_matchup(
     match_type: str,
     player_weights: dict[str, float],
     players_df: pd.DataFrame,
+    matches_df: pd.DataFrame,
     elo_history_df: pd.DataFrame,
     players_lookup: dict[str, str],
     forced_ids: list[str] | None = None,
@@ -1603,7 +1618,7 @@ def _random_elo_rule_matchup(
     if len(eligible_ids) < needed:
         return {}
 
-    elo_map = current_elo_map(players_df, elo_history_df)
+    elo_map = current_elo_map(players_df, elo_history_df, matches_df)
     if elo_overrides:
         elo_map.update({str(pid): float(value) for pid, value in elo_overrides.items()})
 
@@ -1757,7 +1772,7 @@ def render_matchup_recommender_page(players_df: pd.DataFrame, matches_df: pd.Dat
     )
     forced_ids = due_ids[:min_needed]
 
-    elo_map = current_elo_map(players_df, elo_history_df)
+    elo_map = current_elo_map(players_df, elo_history_df, matches_df)
     elo_map.update(elo_overrides)
     present_summary = pd.DataFrame([
         {
@@ -1805,6 +1820,7 @@ def render_matchup_recommender_page(players_df: pd.DataFrame, matches_df: pd.Dat
             match_type=match_type,
             player_weights=player_weights,
             players_df=players_df,
+            matches_df=matches_df,
             elo_history_df=elo_history_df,
             players_lookup=players_lookup_local,
             forced_ids=forced_ids,
