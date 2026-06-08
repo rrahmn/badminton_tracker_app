@@ -4,7 +4,9 @@ from typing import Iterable
 
 BASE_ELO = 1000
 K_FACTOR = 16
-ELO_MODEL_VERSION = "team_average_v2"
+ELO_MODEL_VERSION = "lifetime_team_average_v2"
+SEASON_K_FACTOR = 32
+SEASONAL_ELO_MODEL_VERSION = "season_team_average_v1"
 
 
 def expected_score(rating_a: float, rating_b: float) -> float:
@@ -16,7 +18,7 @@ def team_rating(player_ratings: Iterable[float]) -> float:
     return sum(ratings) / len(ratings)
 
 
-def update_team_elos(team_a_ratings: list[float], team_b_ratings: list[float], winner: str) -> tuple[list[float], list[float]]:
+def update_team_elos(team_a_ratings: list[float], team_b_ratings: list[float], winner: str, k_factor: float = K_FACTOR) -> tuple[list[float], list[float]]:
     team_a_avg = team_rating(team_a_ratings)
     team_b_avg = team_rating(team_b_ratings)
 
@@ -26,8 +28,8 @@ def update_team_elos(team_a_ratings: list[float], team_b_ratings: list[float], w
     actual_a = 1.0 if winner == "A" else 0.0
     actual_b = 1.0 if winner == "B" else 0.0
 
-    delta_a = K_FACTOR * (actual_a - exp_a)
-    delta_b = K_FACTOR * (actual_b - exp_b)
+    delta_a = k_factor * (actual_a - exp_a)
+    delta_b = k_factor * (actual_b - exp_b)
 
     per_player_a = delta_a / len(team_a_ratings)
     per_player_b = delta_b / len(team_b_ratings)

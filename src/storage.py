@@ -24,6 +24,7 @@ DATA_FILES: Dict[str, list[str]] = {
         "scheduled_date",
         "scheduled_time",
         "notes",
+        "season_id",
     ],
     "events": [
         "event_id",
@@ -58,6 +59,30 @@ DATA_FILES: Dict[str, list[str]] = {
         "team",
         "slot",
     ],
+    "seasons": [
+        "season_id",
+        "name",
+        "start_date",
+        "end_date",
+        "season_k_factor",
+        "base_elo",
+        "is_active",
+        "notes",
+        "created_at",
+    ],
+    "seasonal_elo_history": [
+        "history_id",
+        "season_id",
+        "match_id",
+        "player_id",
+        "old_elo",
+        "new_elo",
+        "delta",
+        "recorded_at",
+        "elo_model_version",
+        "k_factor_used",
+        "created_at",
+    ],
 }
 
 DB_MATCH_COLUMNS = [
@@ -74,6 +99,7 @@ DB_MATCH_COLUMNS = [
     "match_date",
     "match_time",
     "notes",
+    "season_id",
 ]
 
 PRIMARY_KEYS: Dict[str, list[str]] = {
@@ -82,6 +108,8 @@ PRIMARY_KEYS: Dict[str, list[str]] = {
     "events": ["event_id"],
     "elo_history": ["history_id"],
     "match_participants": ["match_id", "player_id", "team", "slot"],
+    "seasons": ["season_id"],
+    "seasonal_elo_history": ["history_id"],
 }
 
 
@@ -145,9 +173,11 @@ def _df_to_records(df: pd.DataFrame) -> list[dict[str, Any]]:
 def _normalize_db_nulls(name: str, payload: dict[str, Any]) -> dict[str, Any]:
     normalized = dict(payload)
     nullable_text_blank_to_none: dict[str, set[str]] = {
-        "matches": {"completed_at", "video_url", "notes", "winner", "status", "match_type", "match_date", "match_time"},
+        "matches": {"completed_at", "video_url", "notes", "winner", "status", "match_type", "match_date", "match_time", "season_id"},
         "events": {"note", "player_id", "video_start_label", "video_end_label", "clip_url", "team", "event_type"},
         "elo_history": {"elo_model_version"},
+        "seasonal_elo_history": {"elo_model_version", "season_id"},
+        "seasons": {"end_date", "notes"},
         "players": set(),
         "match_participants": set(),
     }
@@ -155,13 +185,15 @@ def _normalize_db_nulls(name: str, payload: dict[str, Any]) -> dict[str, Any]:
         "matches": {"points_to_win", "team_a_score", "team_b_score"},
         "events": {"event_index", "points_awarded", "video_start_seconds", "video_end_seconds"},
         "elo_history": {"old_elo", "new_elo", "delta", "k_factor_used"},
+        "seasonal_elo_history": {"old_elo", "new_elo", "delta", "k_factor_used"},
+        "seasons": {"season_k_factor", "base_elo"},
         "match_participants": {"slot"},
     }
     for col in nullable_text_blank_to_none.get(name, set()):
         if normalized.get(col) == "":
             normalized[col] = None
     # typed / optional columns that must never be sent as empty strings
-    for col in ["created_at", "completed_at", "timestamp", "recorded_at", "match_date", "match_time"]:
+    for col in ["created_at", "completed_at", "timestamp", "recorded_at", "match_date", "match_time", "start_date", "end_date"]:
         if col in normalized and normalized.get(col) == "":
             normalized[col] = None
 
@@ -330,6 +362,7 @@ class SupabaseStorage:
                 "match_date": payload.get("scheduled_date"),
                 "match_time": payload.get("scheduled_time"),
                 "notes": payload.get("notes"),
+                "season_id": payload.get("season_id"),
             }
         payload = _normalize_db_nulls(name, payload)
         on_conflict = ",".join(PRIMARY_KEYS[name])

@@ -17,7 +17,7 @@ import streamlit as st
 
 from src.auth import auth_is_configured, get_display_name, get_role, logout, require_editor, require_login
 from src.analytics import build_elo_timeline_df, build_partner_matrix_df, build_player_relationship_insights, build_player_loss_risk_df, build_player_head_to_head_df, build_player_match_timeline_df, build_player_clutch_summary_df, build_player_context_setup_options, build_replacement_benchmark_df, summarise_replacement_benchmark, build_player_elo_relationship_timeline_df
-from src.elo import BASE_ELO, ELO_MODEL_VERSION, K_FACTOR, update_team_elos
+from src.elo import BASE_ELO, ELO_MODEL_VERSION, K_FACTOR, SEASON_K_FACTOR, SEASONAL_ELO_MODEL_VERSION, update_team_elos
 from src.stats import build_player_stats, current_elo_map
 from src.storage import CSVStorage, SupabaseStorage, DATA_FILES
 
@@ -162,7 +162,7 @@ def safe_load(name: str) -> pd.DataFrame:
     if name == "matches":
         text_cols = [
             "match_id", "created_at", "completed_at", "match_type", "team_a_players", "team_b_players",
-            "winner", "status", "video_url", "scheduled_date", "scheduled_time", "notes"
+            "winner", "status", "video_url", "scheduled_date", "scheduled_time", "notes", "season_id"
         ]
         int_cols = ["points_to_win", "team_a_score", "team_b_score"]
         for col in text_cols:
@@ -210,6 +210,22 @@ def safe_load(name: str) -> pd.DataFrame:
         for col in num_cols:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
 
+    elif name == "seasonal_elo_history":
+        text_cols = ["history_id", "season_id", "match_id", "player_id", "recorded_at", "elo_model_version", "created_at"]
+        num_cols = ["old_elo", "new_elo", "delta", "k_factor_used"]
+        for col in text_cols:
+            df[col] = df[col].fillna("").astype(str)
+        for col in num_cols:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+
+    elif name == "seasons":
+        text_cols = ["season_id", "name", "start_date", "end_date", "notes", "created_at"]
+        for col in text_cols:
+            df[col] = df[col].fillna("").astype(str)
+        df["season_k_factor"] = pd.to_numeric(df["season_k_factor"], errors="coerce").fillna(SEASON_K_FACTOR).astype(int)
+        df["base_elo"] = pd.to_numeric(df["base_elo"], errors="coerce").fillna(BASE_ELO).astype(int)
+        df["is_active"] = df["is_active"].fillna(False)
+
     elif name == "match_participants":
         text_cols = ["match_id", "player_id", "team"]
         int_cols = ["slot"]
@@ -227,6 +243,8 @@ def refresh_state() -> None:
     st.session_state.events_df = safe_load("events")
     st.session_state.elo_history_df = safe_load("elo_history")
     st.session_state.match_participants_df = safe_load("match_participants")
+    st.session_state.seasons_df = safe_load("seasons")
+    st.session_state.seasonal_elo_history_df = safe_load("seasonal_elo_history")
 
 
 if "booted" not in st.session_state:
@@ -472,6 +490,271 @@ def _match_completed_sort_key(row: pd.Series) -> pd.Timestamp:
     return parsed if not pd.isna(parsed) else pd.Timestamp.max
 
 
+
+def _match_order_sort_frame(matches: pd.DataFrame) -> pd.DataFrame:
+    out = matches.copy()
+    if out.empty:
+        return out
+    out["_created_sort_key"] = out.apply(_match_created_sort_key, axis=1)
+    out["_match_datetime_sort_key"] = out.apply(_match_datetime_sort_key, axis=1)
+    out["_completed_sort_key"] = out.apply(_match_completed_sort_key, axis=1)
+    return out.sort_values(["_created_sort_key", "_match_datetime_sort_key", "_completed_sort_key", "match_id"])
+
+
+def get_active_season() -> pd.Series | None:
+    seasons = st.session_state.get("seasons_df", pd.DataFrame()).copy()
+    if seasons.empty:
+        return None
+    active = seasons[seasons["is_active"].astype(str).str.lower().isin(["true", "1", "yes"])]
+    if active.empty:
+        seasons["_start_dt"] = pd.to_datetime(seasons["start_date"], errors="coerce")
+        seasons = seasons.sort_values(["_start_dt", "created_at"], na_position="last")
+        return seasons.iloc[-1] if not seasons.empty else None
+    active["_start_dt"] = pd.to_datetime(active["start_date"], errors="coerce")
+    active = active.sort_values(["_start_dt", "created_at"], na_position="last")
+    return active.iloc[-1]
+
+
+def find_season_for_date(match_date_value: str | date | None) -> str:
+    seasons = st.session_state.get("seasons_df", pd.DataFrame()).copy()
+    if seasons.empty:
+        return ""
+    target = pd.to_datetime(str(match_date_value or ""), errors="coerce")
+    if pd.isna(target):
+        active = get_active_season()
+        return str(active["season_id"]) if active is not None else ""
+
+    seasons["_start_dt"] = pd.to_datetime(seasons["start_date"], errors="coerce")
+    seasons["_end_dt"] = pd.to_datetime(seasons["end_date"], errors="coerce")
+    matching = seasons[
+        seasons["_start_dt"].notna()
+        & (seasons["_start_dt"] <= target)
+        & (seasons["_end_dt"].isna() | (target <= seasons["_end_dt"]))
+    ].copy()
+    if matching.empty:
+        active = get_active_season()
+        return str(active["season_id"]) if active is not None else ""
+    matching = matching.sort_values(["_start_dt", "created_at"], na_position="last")
+    return str(matching.iloc[-1]["season_id"])
+
+
+def get_season_label(season_id: str) -> str:
+    seasons = st.session_state.get("seasons_df", pd.DataFrame())
+    rows = seasons[seasons["season_id"].astype(str) == str(season_id)]
+    if rows.empty:
+        return "No season"
+    row = rows.iloc[0]
+    suffix = " (active)" if str(row.get("is_active", "")).lower() in ["true", "1", "yes"] else ""
+    return f"{row.get('name', 'Season')}{suffix}"
+
+
+def match_has_seasonal_elo_update(season_id: str, match_id: str) -> bool:
+    history = st.session_state.get("seasonal_elo_history_df", pd.DataFrame())
+    if history.empty:
+        return False
+    return (
+        history["season_id"].astype(str).eq(str(season_id))
+        & history["match_id"].astype(str).eq(str(match_id))
+    ).any()
+
+
+def apply_seasonal_elo_for_match(match_id: str, winner: str, match_row: pd.Series | None = None) -> None:
+    if match_row is None:
+        rows = st.session_state.matches_df[st.session_state.matches_df["match_id"].astype(str) == str(match_id)]
+        if rows.empty:
+            return
+        match_row = rows.iloc[0]
+
+    season_id = str(match_row.get("season_id", "") or "").strip()
+    if not season_id:
+        season_id = find_season_for_date(str(match_row.get("scheduled_date", "") or ""))
+    if not season_id or match_has_seasonal_elo_update(season_id, match_id):
+        return
+
+    seasons = st.session_state.seasons_df
+    season_rows = seasons[seasons["season_id"].astype(str) == season_id]
+    if season_rows.empty:
+        return
+    season = season_rows.iloc[0]
+    season_k = int(pd.to_numeric(pd.Series([season.get("season_k_factor", SEASON_K_FACTOR)]), errors="coerce").fillna(SEASON_K_FACTOR).iloc[0])
+    season_base = int(pd.to_numeric(pd.Series([season.get("base_elo", BASE_ELO)]), errors="coerce").fillna(BASE_ELO).iloc[0])
+
+    players_df = st.session_state.players_df.copy()
+    season_history = st.session_state.seasonal_elo_history_df.copy()
+    season_history = season_history[season_history["season_id"].astype(str) == season_id] if not season_history.empty else season_history
+    seasonal_map = current_elo_map(players_df, season_history, st.session_state.matches_df)
+    # current_elo_map uses BASE_ELO for players without history; adjust to the season base.
+    for pid in players_df["player_id"].astype(str).tolist():
+        if season_history.empty or pid not in season_history["player_id"].astype(str).tolist():
+            seasonal_map[pid] = float(season_base)
+
+    team_a_ids = get_match_team_ids(match_row, "A")
+    team_b_ids = get_match_team_ids(match_row, "B")
+    if not team_a_ids or not team_b_ids or winner not in {"A", "B"}:
+        return
+
+    team_a_old = [seasonal_map.get(pid, season_base) for pid in team_a_ids]
+    team_b_old = [seasonal_map.get(pid, season_base) for pid in team_b_ids]
+    team_a_new, team_b_new = update_team_elos(team_a_old, team_b_old, winner, k_factor=season_k)
+    recorded_at = str(match_row.get("completed_at", "") or "").strip() or str(match_row.get("created_at", "") or "").strip() or now_iso()
+
+    rows = []
+    for pid, old, new in list(zip(team_a_ids, team_a_old, team_a_new)) + list(zip(team_b_ids, team_b_old, team_b_new)):
+        old_i = int(round(old))
+        new_i = int(round(new))
+        rows.append({
+            "history_id": str(uuid4()),
+            "season_id": season_id,
+            "match_id": match_id,
+            "player_id": pid,
+            "old_elo": old_i,
+            "new_elo": new_i,
+            "delta": new_i - old_i,
+            "recorded_at": recorded_at,
+            "elo_model_version": SEASONAL_ELO_MODEL_VERSION,
+            "k_factor_used": int(season_k),
+            "created_at": now_iso(),
+        })
+
+    if rows:
+        history = st.session_state.seasonal_elo_history_df.copy()
+        history = pd.concat([history, pd.DataFrame(rows)], ignore_index=True)
+        storage.save("seasonal_elo_history", history)
+        refresh_state()
+
+
+def recalculate_seasonal_elo_history() -> int:
+    require_editor()
+    seasons = st.session_state.seasons_df.copy()
+    if seasons.empty:
+        storage.save("seasonal_elo_history", pd.DataFrame(columns=DATA_FILES["seasonal_elo_history"]))
+        refresh_state()
+        return 0
+
+    completed = st.session_state.matches_df.copy()
+    completed = completed[
+        completed["status"].astype(str).str.lower().eq("completed")
+        & completed["winner"].astype(str).isin(["A", "B"])
+    ].copy()
+    if completed.empty:
+        storage.save("seasonal_elo_history", pd.DataFrame(columns=DATA_FILES["seasonal_elo_history"]))
+        refresh_state()
+        return 0
+
+    rebuilt_rows: list[dict] = []
+    processed = 0
+
+    for _, season in seasons.iterrows():
+        season_id = str(season["season_id"])
+        season_k = int(pd.to_numeric(pd.Series([season.get("season_k_factor", SEASON_K_FACTOR)]), errors="coerce").fillna(SEASON_K_FACTOR).iloc[0])
+        season_base = int(pd.to_numeric(pd.Series([season.get("base_elo", BASE_ELO)]), errors="coerce").fillna(BASE_ELO).iloc[0])
+
+        season_matches = completed[completed["season_id"].astype(str) == season_id].copy()
+        if season_matches.empty:
+            continue
+        season_matches = _match_order_sort_frame(season_matches)
+        season_map = {str(row["player_id"]): float(season_base) for _, row in st.session_state.players_df.iterrows()}
+
+        for _, match_row in season_matches.iterrows():
+            match_id = str(match_row.get("match_id", "") or "").strip()
+            winner = str(match_row.get("winner", "") or "").strip()
+            team_a_ids = get_match_team_ids(match_row, "A")
+            team_b_ids = get_match_team_ids(match_row, "B")
+            if not match_id or winner not in {"A", "B"} or not team_a_ids or not team_b_ids:
+                continue
+
+            team_a_old = [season_map.get(pid, season_base) for pid in team_a_ids]
+            team_b_old = [season_map.get(pid, season_base) for pid in team_b_ids]
+            team_a_new, team_b_new = update_team_elos(team_a_old, team_b_old, winner, k_factor=season_k)
+            recorded_at = str(match_row.get("completed_at", "") or "").strip() or str(match_row.get("created_at", "") or "").strip() or now_iso()
+
+            for pid, old, new in zip(team_a_ids, team_a_old, team_a_new):
+                old_i = int(round(old))
+                new_i = int(round(new))
+                rebuilt_rows.append({
+                    "history_id": str(uuid4()),
+                    "season_id": season_id,
+                    "match_id": match_id,
+                    "player_id": pid,
+                    "old_elo": old_i,
+                    "new_elo": new_i,
+                    "delta": new_i - old_i,
+                    "recorded_at": recorded_at,
+                    "elo_model_version": SEASONAL_ELO_MODEL_VERSION,
+                    "k_factor_used": int(season_k),
+                    "created_at": now_iso(),
+                })
+                season_map[pid] = new_i
+
+            for pid, old, new in zip(team_b_ids, team_b_old, team_b_new):
+                old_i = int(round(old))
+                new_i = int(round(new))
+                rebuilt_rows.append({
+                    "history_id": str(uuid4()),
+                    "season_id": season_id,
+                    "match_id": match_id,
+                    "player_id": pid,
+                    "old_elo": old_i,
+                    "new_elo": new_i,
+                    "delta": new_i - old_i,
+                    "recorded_at": recorded_at,
+                    "elo_model_version": SEASONAL_ELO_MODEL_VERSION,
+                    "k_factor_used": int(season_k),
+                    "created_at": now_iso(),
+                })
+                season_map[pid] = new_i
+            processed += 1
+
+    rebuilt = pd.DataFrame(rebuilt_rows, columns=DATA_FILES["seasonal_elo_history"])
+    storage.save("seasonal_elo_history", rebuilt)
+    refresh_state()
+    return processed
+
+
+def create_new_season(name: str, start_date_value: date, season_k_factor: int = SEASON_K_FACTOR, notes: str = "") -> None:
+    require_editor()
+    seasons = st.session_state.seasons_df.copy()
+    start_text = str(start_date_value)
+    if not seasons.empty and seasons["name"].astype(str).str.lower().eq(str(name).strip().lower()).any():
+        st.error("A season with that name already exists.")
+        return
+
+    if not seasons.empty:
+        for col in ["end_date", "is_active"]:
+            seasons[col] = seasons[col].astype(object)
+        active_mask = seasons["is_active"].astype(str).str.lower().isin(["true", "1", "yes"])
+        end_date = (pd.to_datetime(start_text) - pd.Timedelta(days=1)).date().isoformat()
+        seasons.loc[active_mask, "end_date"] = end_date
+        seasons.loc[active_mask, "is_active"] = False
+        # Save the old active season as inactive before inserting the new active one.
+        # This avoids the one-active-season unique index tripping during a batch upsert.
+        storage.save("seasons", seasons)
+        refresh_state()
+        seasons = st.session_state.seasons_df.copy()
+
+    new_row = {
+        "season_id": str(uuid4()),
+        "name": str(name).strip(),
+        "start_date": start_text,
+        "end_date": "",
+        "season_k_factor": int(season_k_factor),
+        "base_elo": BASE_ELO,
+        "is_active": True,
+        "notes": str(notes or "").strip(),
+        "created_at": now_iso(),
+    }
+    seasons = pd.concat([seasons, pd.DataFrame([new_row])], ignore_index=True)
+    storage.save("seasons", seasons)
+
+    matches = st.session_state.matches_df.copy()
+    if not matches.empty:
+        missing = matches["season_id"].fillna("").astype(str).str.strip().eq("")
+        if missing.any():
+            matches.loc[missing, "season_id"] = matches.loc[missing, "scheduled_date"].apply(find_season_for_date)
+            storage.save("matches", matches)
+    refresh_state()
+
+
 def recalculate_elo_history() -> int:
     require_editor()
 
@@ -577,6 +860,7 @@ def complete_match(match_id: str) -> None:
 
     updated_row = st.session_state.matches_df[st.session_state.matches_df["match_id"].astype(str) == str(match_id)].iloc[0]
     apply_elo_for_match(match_id, winner, updated_row)
+    apply_seasonal_elo_for_match(match_id, winner, updated_row)
 
 
 
@@ -813,6 +1097,7 @@ def import_completed_matches(parsed_df: pd.DataFrame) -> tuple[int, int]:
             "scheduled_date": str(row.get("scheduled_date", "") or ""),
             "scheduled_time": str(row.get("scheduled_time", "") or ""),
             "notes": f"Imported via CSV | Source row: {int(row.get('spreadsheet_row', 0))}",
+            "season_id": find_season_for_date(str(row.get("scheduled_date", "") or "")),
         }
         storage.append_row("matches", match_row)
         for participant in create_match_participants_rows(match_id, team_a_ids, team_b_ids).to_dict("records"):
@@ -821,6 +1106,7 @@ def import_completed_matches(parsed_df: pd.DataFrame) -> tuple[int, int]:
     refresh_state()
     if imported:
         recalculate_elo_history()
+        recalculate_seasonal_elo_history()
     return imported, skipped
 
 def parse_date_str(raw: str) -> date:
@@ -958,6 +1244,30 @@ def render_elo_history_page(players_df: pd.DataFrame, matches_df: pd.DataFrame, 
         )
         elo_bar.update_layout(height=360, margin=dict(l=10, r=10, t=50, b=10))
         st.plotly_chart(elo_bar, use_container_width=True)
+
+    active_season = get_active_season()
+    if active_season is not None:
+        st.markdown(f"#### Current season Elo — {active_season['name']}")
+        active_season_id = str(active_season["season_id"])
+        season_history = st.session_state.seasonal_elo_history_df
+        season_history = season_history[season_history["season_id"].astype(str) == active_season_id] if not season_history.empty else season_history
+        season_map = current_elo_map(players_df, season_history, matches_df)
+        season_base = int(active_season.get("base_elo", BASE_ELO) or BASE_ELO)
+        if season_history.empty:
+            season_map = {str(row["player_id"]): float(season_base) for _, row in players_df.iterrows()}
+        season_rows = []
+        for _, player in players_df.iterrows():
+            pid = str(player["player_id"])
+            season_rows.append({"name": player["name"], "season_elo": float(season_map.get(pid, season_base))})
+        season_leaderboard = pd.DataFrame(season_rows).sort_values("season_elo", ascending=False)
+        st.dataframe(
+            season_leaderboard,
+            use_container_width=True,
+            hide_index=True,
+            column_config={"season_elo": st.column_config.NumberColumn("Season Elo", format="%.0f")},
+        )
+    else:
+        st.info("No season exists yet. Create Season 1 from the Admin tab after running the database scripts.")
 
     st.markdown("#### Elo history")
     matches_view = add_match_display_columns(matches_df, players_lookup)
@@ -2636,6 +2946,7 @@ with tab1:
                             "scheduled_date": str(match_date),
                             "scheduled_time": str(match_time),
                             "notes": (notes or "").strip(),
+                            "season_id": find_season_for_date(str(match_date)),
                         }
                         storage.append_row("matches", row)
                         participants_payload = pd.concat([st.session_state.match_participants_df, create_match_participants_rows(row["match_id"], parse_players(row["team_a_players"]), parse_players(row["team_b_players"]))], ignore_index=True)
@@ -2644,6 +2955,7 @@ with tab1:
                         if is_completed:
                             created_match = st.session_state.matches_df[st.session_state.matches_df["match_id"].astype(str) == match_id_new].iloc[0]
                             apply_elo_for_match(match_id_new, winner, created_match)
+                            apply_seasonal_elo_for_match(match_id_new, winner, created_match)
                             st.success("Completed match saved and Elo updated. You can annotate it later from Matches.")
                         else:
                             st.success("Live match created.")
@@ -2986,17 +3298,50 @@ with tab12:
     if current_role != "admin":
         st.info("General Viewer mode: admin tools are hidden.")
     else:
+        st.markdown("### Seasons")
+        seasons_view = st.session_state.seasons_df.copy()
+        if seasons_view.empty:
+            st.info("No seasons yet. Run the database setup/backfill SQL first, or create the first season here.")
+        else:
+            st.dataframe(
+                seasons_view[["name", "start_date", "end_date", "season_k_factor", "base_elo", "is_active", "notes"]],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        with st.expander("Create new season", expanded=False):
+            new_season_name = st.text_input("Season name", placeholder="Season 2")
+            new_season_start = st.date_input("Season start date", value=date.today(), key="new_season_start_date")
+            new_season_k = st.number_input("Season K factor", min_value=1, max_value=100, value=SEASON_K_FACTOR, step=1)
+            new_season_notes = st.text_area("Season notes", placeholder="Optional")
+            if st.button("Create season", disabled=not new_season_name.strip(), type="primary", use_container_width=True):
+                create_new_season(new_season_name, new_season_start, int(new_season_k), new_season_notes)
+                st.success("Season created. Previous active season was closed.")
+                st.rerun()
+
+        st.divider()
+
         st.markdown("### Recalculate Elo")
-        st.write("Use this after deleting duplicate matches or changing match results. It clears Elo history and rebuilds it from completed matches in chronological order.")
+        st.write("Lifetime Elo uses K=16. Seasonal Elo uses each season's K factor, default 32. Rebuilds replay matches from historical order rather than current displayed Elo.")
         completed_count = int(matches_df[
             matches_df["status"].astype(str).str.lower().eq("completed")
             & matches_df["winner"].astype(str).isin(["A", "B"])
         ].shape[0]) if not matches_df.empty else 0
         st.caption(f"Completed matches eligible for Elo rebuild: {completed_count}")
-        confirm_recalc = st.checkbox("I understand this will replace the existing Elo history", key="confirm_recalculate_elo")
-        if st.button("Recalculate Elo from completed matches", disabled=not confirm_recalc, type="primary", use_container_width=True):
+        confirm_recalc = st.checkbox("I understand this will replace Elo history tables", key="confirm_recalculate_elo")
+        recalc_cols = st.columns(3)
+        if recalc_cols[0].button("Recalculate lifetime Elo", disabled=not confirm_recalc, type="primary", use_container_width=True):
             processed = recalculate_elo_history()
-            st.success(f"Elo recalculated from {processed} completed match(es).")
+            st.success(f"Lifetime Elo recalculated from {processed} completed match(es).")
+            st.rerun()
+        if recalc_cols[1].button("Recalculate seasonal Elo", disabled=not confirm_recalc, use_container_width=True):
+            processed = recalculate_seasonal_elo_history()
+            st.success(f"Seasonal Elo recalculated from {processed} completed match(es).")
+            st.rerun()
+        if recalc_cols[2].button("Recalculate both", disabled=not confirm_recalc, use_container_width=True):
+            life_count = recalculate_elo_history()
+            season_count = recalculate_seasonal_elo_history()
+            st.success(f"Lifetime Elo recalculated from {life_count} match(es). Seasonal Elo recalculated from {season_count} match(es).")
             st.rerun()
 
         st.divider()
