@@ -941,7 +941,7 @@ def _parse_import_date(date_raw: str, default_year: int) -> tuple[str | None, st
         return None, "Missing date"
     parsed = pd.to_datetime(f"{text}-{default_year}", format="%d-%b-%Y", errors="coerce")
     if pd.isna(parsed):
-        parsed = pd.to_datetime(f"{text} {default_year}", errors="coerce")
+        parsed = pd.to_datetime(f"{text} {default_year}", dayfirst=True, errors="coerce")
     if pd.isna(parsed):
         parsed = pd.to_datetime(text, dayfirst=True, errors="coerce")
     if pd.isna(parsed):
