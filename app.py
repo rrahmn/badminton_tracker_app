@@ -1228,7 +1228,7 @@ def render_elo_history_page(players_df: pd.DataFrame, matches_df: pd.DataFrame, 
         st.info("Add players and complete matches to see Elo.")
         return
 
-    leaderboard = stats_df[["name", "elo", "matches_played", "wins", "losses", "win_rate"]].copy()
+    leaderboard = stats_df[stats_df["name"].isin(players_df.loc[players_df["is_active"] == True, "name"])][["name", "elo", "matches_played", "wins", "losses", "win_rate"]].copy()
     top_cols = st.columns([1.1, 1.4])
     with top_cols[0]:
         st.markdown("#### Current leaderboard")
@@ -1256,7 +1256,7 @@ def render_elo_history_page(players_df: pd.DataFrame, matches_df: pd.DataFrame, 
         if season_history.empty:
             season_map = {str(row["player_id"]): float(season_base) for _, row in players_df.iterrows()}
         season_rows = []
-        for _, player in players_df.iterrows():
+        for _, player in players_df[players_df["is_active"] == True].iterrows():
             pid = str(player["player_id"])
             season_rows.append({"name": player["name"], "season_elo": float(season_map.get(pid, season_base))})
         season_leaderboard = pd.DataFrame(season_rows).sort_values("season_elo", ascending=False)
